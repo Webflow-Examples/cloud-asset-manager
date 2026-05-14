@@ -2247,6 +2247,7 @@ export function AssetManager() {
     [visibleAssets, canBulkSelect, showTrash],
   );
   const selectedCount = selectedAssetIds.size;
+  const isBulkSelectionActive = selectedCount > 0;
   const selectedSelectableCount = React.useMemo(
     () => selectableAssets.filter((asset) => selectedAssetIds.has(asset.id)).length,
     [selectableAssets, selectedAssetIds],
@@ -2929,6 +2930,8 @@ export function AssetManager() {
                           const Icon = assetIcon(asset);
                           const selectable = assetIsSelectable(asset);
                           const selected = selectedAssetIds.has(asset.id);
+                          const identityTogglesSelection =
+                            isBulkSelectionActive && canBulkSelect && selectable;
                           const assetIdentity = (
                             <div className="flex min-w-0 items-center gap-3">
                               <AssetListMedia asset={asset} Icon={Icon} />
@@ -2969,21 +2972,26 @@ export function AssetManager() {
                                 </TableCell>
                               ) : null}
                               <TableCell className="px-5 py-3">
-                                {canBulkSelect && selectable ? (
-                                  <button
-                                    type="button"
-                                    className="block w-full rounded-[6px] text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                                    onClick={(event) =>
-                                      toggleAssetSelection(asset.id, event.shiftKey)
+                                <button
+                                  type="button"
+                                  className="block w-full rounded-[6px] text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                                  onClick={(event) => {
+                                    if (identityTogglesSelection) {
+                                      toggleAssetSelection(asset.id, event.shiftKey);
+                                      return;
                                     }
-                                    aria-pressed={selected}
-                                    aria-label={`${selected ? "Deselect" : "Select"} ${asset.displayName}`}
-                                  >
-                                    {assetIdentity}
-                                  </button>
-                                ) : (
-                                  assetIdentity
-                                )}
+
+                                    openDetails(asset, event.currentTarget);
+                                  }}
+                                  aria-pressed={identityTogglesSelection ? selected : undefined}
+                                  aria-label={
+                                    identityTogglesSelection
+                                      ? `${selected ? "Deselect" : "Select"} ${asset.displayName}`
+                                      : `Open details for ${asset.displayName}`
+                                  }
+                                >
+                                  {assetIdentity}
+                                </button>
                               </TableCell>
                               <TableCell className="hidden py-3 lg:table-cell">
                                 <div className="flex min-w-0 items-center gap-2">
