@@ -67,6 +67,7 @@ SQLite schema changes live in `migrations/`. Webflow Cloud applies new migration
 Start from `.env.example`.
 
 - Set `ORIGIN` to the deployed asset manager origin before enabling auth.
+- Set `ASSET_MANAGER_DEMO_MODE=false` before using the app as a production asset manager.
 - Set `ASSET_MANAGER_AUTH_ENABLED=true` only after wiring `src/lib/auth.ts`.
 - Keep `ASSET_MANAGER_PROTECT_ASSET_DELIVERY=false` if copied asset URLs should work on public sites.
 - Set `STORAGE_PLAN_LIMIT_BYTES` and `STORAGE_PLAN_LABEL` if you want a usage progress bar.
@@ -105,6 +106,12 @@ Preview the production build locally:
 npm run preview
 ```
 
+With a preview or deployed demo running, run the focused demo route smoke check:
+
+```bash
+DEMO_CHECK_BASE_URL=http://localhost:8787/assets npm run check:demo
+```
+
 ## Common Setup Issues
 
 - Local build fails with `listen EPERM`: this can happen in restricted sandboxes that block localhost binds. Re-run in a normal terminal.
@@ -114,3 +121,28 @@ npm run preview
 - Cache policy changes do not change browser/CDN behavior: Webflow Cloud may override `Cache-Control` response headers. Use fresh/cache-busted URLs when immediate invalidation matters.
 - Generated upload URLs duplicate `/assets`: confirm a custom `ASSETS_PREFIX` contains only the origin, not the `/assets` mount path.
 - Auth returns `401` for every request: `ASSET_MANAGER_AUTH_ENABLED=true` is set before `src/lib/auth.ts` returns a valid session.
+- Demo uploads are blocked unexpectedly: demo mode has stricter file type and size limits than production. Set `ASSET_MANAGER_DEMO_MODE=false` after auth is wired if this deployment should manage real assets.
+
+## Demo Mode Defaults
+
+Demo mode is enabled by default for starter and public demo deployments. Each visitor gets an anonymous session cookie, session-scoped asset rows, and temporary object storage under `demo-sessions/<session-id>/`.
+
+Use these defaults unless you have a specific reason to tighten them:
+
+```bash
+ASSET_MANAGER_DEMO_MODE=true
+ASSET_MANAGER_DEMO_SESSION_TTL_HOURS=6
+ASSET_MANAGER_DEMO_MAX_FILE_BYTES=20971520
+ASSET_MANAGER_DEMO_MAX_SESSION_BYTES=52428800
+ASSET_MANAGER_DEMO_MAX_SESSION_ASSETS=25
+```
+
+Cleanup is request-time only. Expired sessions stop serving immediately, then the next app/API requests remove expired rows and objects in small batches. No external cron job is required for the starter.
+
+For production, disable demo mode and enable auth:
+
+```bash
+ASSET_MANAGER_DEMO_MODE=false
+ASSET_MANAGER_AUTH_ENABLED=true
+ASSET_MANAGER_PROTECT_ASSET_DELIVERY=false
+```

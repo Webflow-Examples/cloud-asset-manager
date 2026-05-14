@@ -3,8 +3,11 @@ import {
   cacheControlFor,
   getAssetBySlug,
   getAssetManagerSettings,
+  optionalDemoSessionForRequest,
   storedAssetAllowedOrigins,
+  storageObjectKeyForAsset,
 } from "@/lib/asset-storage";
+import { demoAssetShouldDownload } from "@/lib/asset-demo";
 import {
   assetDomainRestrictionsEnabled,
   checkAssetRequestOrigin,
@@ -105,10 +108,11 @@ function baseHeaders(
   options: { varyByRequestOrigin?: boolean } = {},
 ) {
   const contentType = object.httpMetadata?.contentType || asset.content_type || "application/octet-stream";
+  const disposition = demoAssetShouldDownload(asset) ? "attachment" : "inline";
   const headers = new Headers({
     "Accept-Ranges": "bytes",
     "Cache-Control": cacheControlFor(asset.cache_policy),
-    "Content-Disposition": `inline; filename="${cleanFilename(asset.original_filename)}"`,
+    "Content-Disposition": `${disposition}; filename="${cleanFilename(asset.original_filename)}"`,
     "Content-Type": contentType,
     ETag: etagFor(object, asset),
     "Last-Modified": (object.uploaded || new Date(asset.updated_at)).toUTCString(),
@@ -130,7 +134,14 @@ async function serveFile(request: Request, { params }: Params, headOnly: boolean
   if (!auth.ok) return auth.response;
 
   const { id: slug } = await params;
-  const asset = await getAssetBySlug(env, slug);
+  const demo = await optionalDemoSessionForRequest(env, request);
+  const demoOnly = new URL(request.url).searchParams.get("demo") === "1";
+  const asset = await getAssetBySlug(
+    env,
+    slug,
+    demo.enabled && demo.sessionId ? { demoSessionId: demo.sessionId } : undefined,
+    { demoOnly },
+  );
 
   if (!asset) {
     return new Response("Asset not found.", { status: 404 });
@@ -157,7 +168,12 @@ async function serveFile(request: Request, { params }: Params, headOnly: boolean
   });
   if (!domainGate.ok) return domainGate.response;
 
-  const objectHead = await env.CLOUD_ASSETS.head(asset.object_key);
+  const storageObjectKey = await storageObjectKeyForAsset(env, asset);
+  if (!storageObjectKey) {
+    return new Response("Stored object not found.", { status: 404 });
+  }
+
+  const objectHead = await env.CLOUD_ASSETS.head(storageObjectKey);
   if (!objectHead) {
     await markAssetMissing(asset);
     return new Response("Stored object not found.", { status: 404 });
@@ -187,7 +203,7 @@ async function serveFile(request: Request, { params }: Params, headOnly: boolean
   }
 
   const object = await env.CLOUD_ASSETS.get(
-    asset.object_key,
+    storageObjectKey,
     range ? { range: { offset: range.offset, length: range.length } } : undefined,
   );
 

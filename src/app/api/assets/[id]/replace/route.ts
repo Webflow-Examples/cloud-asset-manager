@@ -3,10 +3,13 @@ import { requireAssetManagerApiAuth } from "@/lib/auth-gate";
 import {
   contentTypeFor,
   corsHeaders,
+  assertDemoSessionCapacity,
+  demoSessionForRequest,
   errorResponse,
   getAssetById,
   getUploadBaseUrl,
   jsonResponse,
+  noteDemoAssetStorageChanged,
   objectMetadataForAsset,
   optionsResponse,
   rowToAsset,
@@ -17,6 +20,7 @@ import {
   validateReplacementAsset,
 } from "@/lib/asset-storage";
 import { getAssetManagerEnv } from "@/lib/cloudflare";
+import { demoModeEnabled, demoObjectKey, validateDemoUploadFile } from "@/lib/asset-demo";
 
 export const dynamic = "force-dynamic";
 
@@ -48,6 +52,8 @@ export async function PUT(request: Request, { params }: Params) {
   const headers = corsHeaders(request, env);
   const auth = await requireAssetManagerApiAuth(request, env, headers);
   if (!auth.ok) return auth.response;
+  const demo = await demoSessionForRequest(env, request, headers, { cloneSeedAssets: true });
+  const scope = demo.enabled && demo.sessionId ? { demoSessionId: demo.sessionId } : undefined;
 
   const { id } = await params;
   const url = new URL(request.url);
@@ -63,12 +69,12 @@ export async function PUT(request: Request, { params }: Params) {
       return errorResponse(`Part number exceeds maximum of ${MAX_MULTIPART_PARTS}.`, 400, { headers });
     }
 
-    const row = await getAssetById(env, id);
+    const row = await getAssetById(env, id, scope);
     if (!row) {
       return errorResponse("Asset not found.", 404, { headers });
     }
 
-    if (row.deleted_at || row.status !== "ready") {
+    if (row.deleted_at || (row.status !== "ready" && row.status !== "uploading")) {
       return errorResponse("Only active, ready assets can be replaced.", 400, { headers });
     }
 
@@ -94,7 +100,7 @@ export async function PUT(request: Request, { params }: Params) {
   }
 
   try {
-    const row = await getAssetById(env, id);
+      const row = await getAssetById(env, id, scope);
     if (!row) {
       return errorResponse("Asset not found.", 404, { headers });
     }
@@ -110,9 +116,19 @@ export async function PUT(request: Request, { params }: Params) {
     const contentType = contentTypeFor(file.type);
     const contentSha256 = validateContentSha256(form.get("contentSha256"));
     validateFileSize(file.size, "direct");
-    validateReplacementAsset(row, originalFilename, contentType);
+    if (demo.enabled) {
+      validateDemoUploadFile(env, { filename: originalFilename, contentType, sizeBytes: file.size });
+      await assertDemoSessionCapacity(env, demo.sessionId, file.size, { replacingAsset: row });
+    }
+    validateReplacementAsset(row, originalFilename, contentType, { allowUploading: true });
+    const replacementObjectKey =
+      demo.enabled && demo.sessionId
+        ? row.demo_storage_owner === "demo"
+          ? row.object_key
+          : demoObjectKey(demo.sessionId, row.id, originalFilename)
+        : row.object_key;
 
-    const object = await env.CLOUD_ASSETS.put(row.object_key, file.stream(), {
+    const object = await env.CLOUD_ASSETS.put(replacementObjectKey, file.stream(), {
       httpMetadata: {
         contentType,
       },
@@ -130,6 +146,8 @@ export async function PUT(request: Request, { params }: Params) {
       etag: object.httpEtag || object.etag || null,
       contentSha256,
       updatedAt: object.uploaded?.toISOString?.(),
+      objectKey: replacementObjectKey,
+      demoStorageOwner: demoModeEnabled(env) && demo.sessionId ? "demo" : undefined,
     });
 
     if (!updated) {
@@ -138,6 +156,7 @@ export async function PUT(request: Request, { params }: Params) {
       });
     }
 
+    await noteDemoAssetStorageChanged(env, updated);
     return jsonResponse({ asset: rowToAsset(updated, request) }, { headers });
   } catch (error) {
     return errorResponse(error instanceof Error ? error.message : "Replacement failed.", 400, {
@@ -151,11 +170,13 @@ export async function POST(request: Request, { params }: Params) {
   const headers = corsHeaders(request, env);
   const auth = await requireAssetManagerApiAuth(request, env, headers);
   if (!auth.ok) return auth.response;
+  const demo = await demoSessionForRequest(env, request, headers, { cloneSeedAssets: true });
+  const scope = demo.enabled && demo.sessionId ? { demoSessionId: demo.sessionId } : undefined;
 
   const { id } = await params;
 
   try {
-    const row = await getAssetById(env, id);
+    const row = await getAssetById(env, id, scope);
     if (!row) {
       return errorResponse("Asset not found.", 404, { headers });
     }
@@ -166,14 +187,36 @@ export async function POST(request: Request, { params }: Params) {
     const contentSha256 = validateContentSha256(body.contentSha256);
     const sizeBytes = Number(body.sizeBytes || 0);
     validateFileSize(sizeBytes, "multipart");
+    if (demo.enabled) {
+      validateDemoUploadFile(env, { filename: originalFilename, contentType, sizeBytes });
+      await assertDemoSessionCapacity(env, demo.sessionId, sizeBytes, { replacingAsset: row });
+    }
     validateReplacementAsset(row, originalFilename, contentType);
-
-    const upload = await env.CLOUD_ASSETS.createMultipartUpload(row.object_key, {
+    const replacementObjectKey =
+      demo.enabled && demo.sessionId
+        ? row.demo_storage_owner === "demo"
+          ? row.object_key
+          : demoObjectKey(demo.sessionId, row.id, originalFilename)
+        : row.object_key;
+    const upload = await env.CLOUD_ASSETS.createMultipartUpload(replacementObjectKey, {
       httpMetadata: {
         contentType,
       },
       customMetadata: objectMetadataForAsset(row, originalFilename, contentSha256),
     });
+    if (demo.enabled) {
+      await env.ASSET_INDEX.prepare(
+        `UPDATE assets
+         SET object_key = ?,
+             demo_storage_owner = 'demo',
+             status = 'uploading',
+             updated_at = ?
+         WHERE id = ?
+           AND demo_session_id = ?`,
+      )
+        .bind(replacementObjectKey, new Date().toISOString(), row.id, demo.sessionId || "")
+        .run();
+    }
 
     return jsonResponse(
       {
@@ -199,6 +242,8 @@ export async function PATCH(request: Request, { params }: Params) {
   const headers = corsHeaders(request, env);
   const auth = await requireAssetManagerApiAuth(request, env, headers);
   if (!auth.ok) return auth.response;
+  const demo = await demoSessionForRequest(env, request, headers, { cloneSeedAssets: true });
+  const scope = demo.enabled && demo.sessionId ? { demoSessionId: demo.sessionId } : undefined;
 
   const { id } = await params;
 
@@ -209,17 +254,27 @@ export async function PATCH(request: Request, { params }: Params) {
       return errorResponse("Upload ID and uploaded parts are required.", 400, { headers });
     }
 
-    const row = await getAssetById(env, id);
+    const row = await getAssetById(env, id, scope);
     if (!row) {
       return errorResponse("Asset not found.", 404, { headers });
     }
 
-    if (row.deleted_at || row.status !== "ready") {
+    if (row.deleted_at || (row.status !== "ready" && row.status !== "uploading")) {
       return errorResponse("Only active, ready assets can be replaced.", 400, { headers });
     }
 
     if (body.sizeBytes) {
       validateFileSize(Number(body.sizeBytes), "multipart");
+      if (demo.enabled) {
+        validateDemoUploadFile(env, {
+          filename: body.fileName || row.original_filename,
+          contentType: contentTypeFor(body.contentType || row.content_type),
+          sizeBytes: Number(body.sizeBytes),
+        });
+        await assertDemoSessionCapacity(env, demo.sessionId, Number(body.sizeBytes), {
+          replacingAsset: row,
+        });
+      }
     }
 
     if (body.fileName || body.contentType) {
@@ -227,6 +282,7 @@ export async function PATCH(request: Request, { params }: Params) {
         row,
         validateFileName(body.fileName || row.original_filename),
         contentTypeFor(body.contentType || row.content_type),
+        { allowUploading: true },
       );
     }
 
@@ -245,7 +301,7 @@ export async function PATCH(request: Request, { params }: Params) {
       validateContentSha256(body.contentSha256) ||
       validateContentSha256(object.customMetadata?.contentSha256) ||
       row.content_sha256;
-    validateReplacementAsset(row, originalFilename, contentType);
+    validateReplacementAsset(row, originalFilename, contentType, { allowUploading: true });
 
     const updated = await updateAssetFileMetadata(env, row, {
       originalFilename,
@@ -254,6 +310,7 @@ export async function PATCH(request: Request, { params }: Params) {
       etag: object.httpEtag || object.etag || null,
       contentSha256,
       updatedAt: object.uploaded?.toISOString?.(),
+      demoStorageOwner: demoModeEnabled(env) && demo.sessionId ? "demo" : undefined,
     });
 
     if (!updated) {
@@ -262,6 +319,7 @@ export async function PATCH(request: Request, { params }: Params) {
       });
     }
 
+    await noteDemoAssetStorageChanged(env, updated);
     return jsonResponse({ asset: rowToAsset(updated, request) }, { headers });
   } catch (error) {
     return errorResponse(
@@ -277,6 +335,8 @@ export async function DELETE(request: Request, { params }: Params) {
   const headers = corsHeaders(request, env);
   const auth = await requireAssetManagerApiAuth(request, env, headers);
   if (!auth.ok) return auth.response;
+  const demo = await demoSessionForRequest(env, request, headers, { cloneSeedAssets: true });
+  const scope = demo.enabled && demo.sessionId ? { demoSessionId: demo.sessionId } : undefined;
 
   const { id } = await params;
   const url = new URL(request.url);
@@ -286,13 +346,25 @@ export async function DELETE(request: Request, { params }: Params) {
     return errorResponse("Upload ID is required.", 400, { headers });
   }
 
-  const row = await getAssetById(env, id);
+    const row = await getAssetById(env, id, scope);
   if (!row) {
     return errorResponse("Asset not found.", 404, { headers });
   }
 
   try {
     await env.CLOUD_ASSETS.resumeMultipartUpload(row.object_key, uploadId).abort();
+    if (demo.enabled) {
+      await env.ASSET_INDEX.prepare(
+        `UPDATE assets
+         SET status = 'failed',
+             updated_at = ?
+         WHERE id = ?
+           AND demo_session_id = ?`,
+      )
+        .bind(new Date().toISOString(), row.id, demo.sessionId || "")
+        .run();
+      await noteDemoAssetStorageChanged(env, row);
+    }
 
     return new Response(null, { status: 204, headers });
   } catch (error) {

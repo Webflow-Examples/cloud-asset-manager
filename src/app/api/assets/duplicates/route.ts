@@ -2,6 +2,7 @@ import { getAssetManagerEnv } from "@/lib/cloudflare";
 import { requireAssetManagerApiAuth } from "@/lib/auth-gate";
 import {
   corsHeaders,
+  demoSessionForRequest,
   errorResponse,
   findDuplicateAssets,
   jsonResponse,
@@ -22,6 +23,7 @@ export async function GET(request: Request) {
   const headers = corsHeaders(request, env);
   const auth = await requireAssetManagerApiAuth(request, env, headers);
   if (!auth.ok) return auth.response;
+  const demo = await demoSessionForRequest(env, request, headers, { cloneSeedAssets: true });
 
   try {
     const url = new URL(request.url);
@@ -31,7 +33,12 @@ export async function GET(request: Request) {
       return errorResponse("SHA-256 hash is required.", 400, { headers });
     }
 
-    const duplicates = await findDuplicateAssets(env, contentSha256, 5);
+    const duplicates = await findDuplicateAssets(
+      env,
+      contentSha256,
+      5,
+      demo.enabled && demo.sessionId ? { demoSessionId: demo.sessionId } : undefined,
+    );
     return jsonResponse(
       { assets: duplicates.map((row) => rowToAsset(row, request)) },
       { headers },

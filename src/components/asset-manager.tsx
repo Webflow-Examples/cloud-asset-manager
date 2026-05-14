@@ -135,11 +135,73 @@ const DEFAULT_CONFIG: RuntimeConfigResponse = {
     signOut: null,
     account: null,
   },
+  demo: {
+    enabled: true,
+    sessionTtlHours: 6,
+    maxSessionBytes: 50 * 1024 * 1024,
+    maxFileBytes: 20 * 1024 * 1024,
+    maxSessionAssets: 25,
+    allowedFileSummary:
+      "Images except SVG, PDFs, text, CSV, JSON, ZIP, MP4, WebM, MOV, GLB, and GLTF",
+    cleanupMode: "request-time",
+  },
 };
 
 const THEME_STORAGE_KEY = "wf-asset-manager-theme";
 const UPLOAD_CONCURRENCY = 2;
 const ASSET_PAGE_SIZE = 24;
+const DEMO_BLOCKED_FILE_MESSAGE =
+  "This file is blocked only in the public demo because demo uploads have extra file type and size limits. A production deployment can allow this file type or a larger file.";
+const DEMO_ALLOWED_EXTENSIONS = new Set([
+  ".avif",
+  ".csv",
+  ".gif",
+  ".glb",
+  ".gltf",
+  ".jpeg",
+  ".jpg",
+  ".json",
+  ".mov",
+  ".mp4",
+  ".pdf",
+  ".png",
+  ".txt",
+  ".webm",
+  ".webp",
+  ".zip",
+]);
+const PRODUCTION_UPLOAD_LIMIT_LABEL = formatBytes(MAX_MULTIPART_UPLOAD_BYTES).replace(
+  ".0 ",
+  " ",
+);
+const DEMO_BLOCKED_EXTENSIONS = new Set([
+  ".bat",
+  ".cmd",
+  ".com",
+  ".exe",
+  ".html",
+  ".htm",
+  ".js",
+  ".mjs",
+  ".msi",
+  ".php",
+  ".ps1",
+  ".sh",
+  ".svg",
+  ".wasm",
+  ".xhtml",
+  ".xml",
+]);
+const DEMO_BLOCKED_MIME_PARTS = [
+  "ecmascript",
+  "html",
+  "javascript",
+  "script",
+  "svg",
+  "x-sh",
+  "x-msdownload",
+  "xml",
+];
 const USAGE_KIND_ORDER: Asset["kind"][] = [
   "image",
   "video",
@@ -329,6 +391,40 @@ function assetKindFromFile(file: File): Asset["kind"] {
   return "file";
 }
 
+function fileExtension(filename: string) {
+  const cleanName = filename.split(/[\\/]/).pop() || "";
+  const dotIndex = cleanName.lastIndexOf(".");
+  if (dotIndex <= 0 || dotIndex === cleanName.length - 1) {
+    return "";
+  }
+
+  return cleanName
+    .slice(dotIndex)
+    .toLowerCase()
+    .replace(/[^a-z0-9.]/g, "");
+}
+
+function demoFilePolicyError(config: RuntimeConfigResponse, file: File | null) {
+  if (!config.demo.enabled || !file) return null;
+
+  if (file.size > config.demo.maxFileBytes) {
+    return `This file is larger than the public demo limit of ${formatBytes(config.demo.maxFileBytes)}. A production deployment can allow larger uploads.`;
+  }
+
+  const extension = fileExtension(file.name);
+  const contentType = (file.type || "").toLowerCase();
+
+  if (
+    !DEMO_ALLOWED_EXTENSIONS.has(extension) ||
+    DEMO_BLOCKED_EXTENSIONS.has(extension) ||
+    DEMO_BLOCKED_MIME_PARTS.some((part) => contentType.includes(part))
+  ) {
+    return DEMO_BLOCKED_FILE_MESSAGE;
+  }
+
+  return null;
+}
+
 function managerViewFromParam(value: string | null): ManagerView {
   return value === "usage" || value === "trash" ? value : "assets";
 }
@@ -408,13 +504,13 @@ async function readUiResponseError(response: Response, fallbackTitle: string) {
     });
   }
 
-  if (response.status === 403) {
-    return new UiResponseError({
-      title: "Access denied",
-      message: "Your session does not have access to this asset manager.",
-      status: response.status,
-    });
-  }
+	  if (response.status === 403) {
+	    return new UiResponseError({
+	      title: "Access denied",
+	      message: detail || "Your session does not have access to this asset manager.",
+	      status: response.status,
+	    });
+	  }
 
   return new UiResponseError({
     title: fallbackTitle,
@@ -1265,6 +1361,8 @@ export function AssetManager() {
 
   function replacementValidationError(asset: Asset, file: File | null) {
     if (!file) return null;
+    const demoError = demoFilePolicyError(config, file);
+    if (demoError) return demoError;
 
     if (file.size <= 0) {
       return "Choose a file that is larger than 0 bytes.";
@@ -1581,7 +1679,20 @@ export function AssetManager() {
     if (item.file.size > config.maxMultipartUploadBytes) {
       patchQueueItem(item.id, {
         status: "error",
-        error: `This file is larger than ${formatBytes(config.maxMultipartUploadBytes)}.`,
+        error:
+          config.demo.enabled && item.file.size > config.demo.maxFileBytes
+            ? `This file is larger than the public demo limit of ${formatBytes(config.demo.maxFileBytes)}. A production deployment can allow larger uploads.`
+            : `This file is larger than ${formatBytes(config.maxMultipartUploadBytes)}.`,
+        progress: 0,
+      });
+      return false;
+    }
+
+    const demoError = demoFilePolicyError(config, item.file);
+    if (demoError) {
+      patchQueueItem(item.id, {
+        status: "error",
+        error: demoError,
         progress: 0,
       });
       return false;
@@ -2382,9 +2493,27 @@ export function AssetManager() {
                     Cloud asset manager
                   </h1>
                 </div>
-              </div>
-              <div className="flex flex-wrap items-center gap-2 text-sm text-muted-foreground">
-                {config.authUi.account ? (
+	              </div>
+	              <div className="flex flex-wrap items-center gap-2 text-sm text-muted-foreground">
+	                {config.demo.enabled ? (
+	                  <Tooltip>
+	                    <TooltipTrigger asChild>
+	                      <Badge
+	                        variant="outline"
+	                        className="h-9 gap-1.5 border-amber-400/45 bg-amber-400/10 px-3 text-foreground"
+	                      >
+	                        <Info className="size-3.5 text-amber-600" />
+	                        Demo mode
+	                      </Badge>
+	                    </TooltipTrigger>
+	                    <TooltipContent className="max-w-80">
+	                      This public demo is temporary. Assets and actions are scoped to this browser
+	                      session and are not permanent. Demo uploads have extra file type and size
+	                      limits; production deployments can allow different limits.
+	                    </TooltipContent>
+	                  </Tooltip>
+	                ) : null}
+	                {config.authUi.account ? (
                   <Tooltip>
                     <TooltipTrigger asChild>
                       <Button variant="outline" size="sm" asChild>
@@ -2467,17 +2596,19 @@ export function AssetManager() {
                       addFiles(event.dataTransfer.files);
                     }
                   }}
-                >
-                  <UploadCloud className="mb-3 size-8 text-primary" />
-                  <span className="text-sm font-semibold">Drop files or browse</span>
-                  <span className="mt-1 text-xs text-muted-foreground">
-                    Files are queued first. Up to{" "}
-                    {formatBytes(config.maxMultipartUploadBytes)} per file.
-                  </span>
+                  >
+                    <UploadCloud className="mb-3 size-8 text-primary" />
+                    <span className="text-sm font-semibold">Drop files or browse</span>
+                    <span className="mt-1 text-xs text-muted-foreground">
+                      {config.demo.enabled
+                        ? `Up to ${formatBytes(config.demo.maxFileBytes)} per file in this demo, up to ${PRODUCTION_UPLOAD_LIMIT_LABEL} on production deployment.`
+                        : `Files are queued first. Up to ${formatBytes(config.maxMultipartUploadBytes)} per file.`}
+                    </span>
                   <input
                     ref={fileInputRef}
                     type="file"
                     multiple
+                    accept={config.demo.enabled ? Array.from(DEMO_ALLOWED_EXTENSIONS).join(",") : undefined}
                     className="sr-only"
                     disabled={isUploadingQueue}
                     onChange={(event) => addFiles(event.target.files || [])}
@@ -3312,9 +3443,10 @@ export function AssetManager() {
                               </div>
                               <div className="flex shrink-0 flex-col gap-2 sm:flex-row">
                                 <input
-                                  ref={replacementInputRef}
-                                  type="file"
-                                  className="hidden"
+	                                  ref={replacementInputRef}
+	                                  type="file"
+	                                  accept={config.demo.enabled ? Array.from(DEMO_ALLOWED_EXTENSIONS).join(",") : undefined}
+	                                  className="hidden"
                                   onChange={(event) =>
                                     chooseReplacementFile(event.currentTarget.files?.[0] || null)
                                   }

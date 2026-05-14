@@ -5,10 +5,13 @@ import {
   corsHeaders,
   createObjectKey,
   createUniqueAssetSlug,
+  demoSessionForRequest,
+  assertDemoSessionCapacity,
   errorResponse,
   insertAsset,
   jsonResponse,
   listAssets,
+  noteDemoAssetStorageChanged,
   optionsResponse,
   rowToAsset,
   normalizeTags,
@@ -19,6 +22,7 @@ import {
   validateFileSize,
   validateFolder,
 } from "@/lib/asset-storage";
+import { demoModeEnabled, demoObjectKey, validateDemoUploadFile } from "@/lib/asset-demo";
 
 export const dynamic = "force-dynamic";
 
@@ -32,8 +36,13 @@ export async function GET(request: Request) {
   const headers = corsHeaders(request, env);
   const auth = await requireAssetManagerApiAuth(request, env, headers);
   if (!auth.ok) return auth.response;
+  const demo = await demoSessionForRequest(env, request, headers, { cloneSeedAssets: true });
 
-  const response = await listAssets(env, request);
+  const response = await listAssets(
+    env,
+    request,
+    demo.enabled && demo.sessionId ? { demoSessionId: demo.sessionId } : undefined,
+  );
 
   return jsonResponse(response, {
     headers,
@@ -45,6 +54,7 @@ export async function POST(request: Request) {
   const headers = corsHeaders(request, env);
   const auth = await requireAssetManagerApiAuth(request, env, headers);
   if (!auth.ok) return auth.response;
+  const demo = await demoSessionForRequest(env, request, headers);
 
   try {
     const form = await request.formData();
@@ -63,9 +73,21 @@ export async function POST(request: Request) {
 
     const id = crypto.randomUUID();
     const originalFilename = validateFileName(file.name);
-    const slug = await createUniqueAssetSlug(env, originalFilename);
-    const objectKey = createObjectKey(id, originalFilename);
     const contentType = contentTypeFor(file.type);
+    if (demo.enabled) {
+      validateDemoUploadFile(env, {
+        filename: originalFilename,
+        contentType,
+        sizeBytes: file.size,
+      });
+      await assertDemoSessionCapacity(env, demo.sessionId, file.size);
+    }
+    const scope = demo.enabled && demo.sessionId ? { demoSessionId: demo.sessionId } : undefined;
+    const slug = await createUniqueAssetSlug(env, originalFilename, { scope });
+    const objectKey =
+      demo.enabled && demo.sessionId
+        ? demoObjectKey(demo.sessionId, id, originalFilename)
+        : createObjectKey(id, originalFilename);
     const object = await env.CLOUD_ASSETS.put(objectKey, file.stream(), {
       httpMetadata: {
         contentType,
@@ -100,6 +122,9 @@ export async function POST(request: Request) {
       uploaded_at: object.uploaded?.toISOString?.(),
       status: "ready",
       tags,
+      demo_session_id: demo.sessionId || "",
+      demo_storage_owner: demoModeEnabled(env) && demo.sessionId ? "demo" : "seed",
+      demo_expires_at: demo.expiresAt,
     });
 
     if (!row) {
@@ -107,6 +132,7 @@ export async function POST(request: Request) {
         headers,
       });
     }
+    await noteDemoAssetStorageChanged(env, row);
 
     return jsonResponse({ asset: rowToAsset(row, request) }, { status: 201, headers });
   } catch (error) {

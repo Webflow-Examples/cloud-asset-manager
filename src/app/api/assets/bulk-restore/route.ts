@@ -3,6 +3,7 @@ import { requireAssetManagerApiAuth } from "@/lib/auth-gate";
 import {
   bulkRestoreAssets,
   corsHeaders,
+  demoSessionForRequest,
   errorResponse,
   jsonResponse,
   optionsResponse,
@@ -20,6 +21,7 @@ export async function POST(request: Request) {
   const headers = corsHeaders(request, env);
   const auth = await requireAssetManagerApiAuth(request, env, headers);
   if (!auth.ok) return auth.response;
+  const demo = await demoSessionForRequest(env, request, headers, { cloneSeedAssets: true });
 
   try {
     const body = (await request.json()) as { ids?: string[] };
@@ -35,7 +37,11 @@ export async function POST(request: Request) {
       return errorResponse("Bulk restore is limited to 100 selected assets.", 400, { headers });
     }
 
-    const result = await bulkRestoreAssets(env, ids);
+    const result = await bulkRestoreAssets(
+      env,
+      ids,
+      demo.enabled && demo.sessionId ? { demoSessionId: demo.sessionId } : undefined,
+    );
 
     return jsonResponse(
       {

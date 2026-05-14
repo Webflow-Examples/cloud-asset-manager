@@ -4,6 +4,7 @@ import {
   bulkDeleteAssetsPermanently,
   bulkSoftDeleteAssets,
   corsHeaders,
+  demoSessionForRequest,
   errorResponse,
   jsonResponse,
   optionsResponse,
@@ -21,6 +22,7 @@ export async function POST(request: Request) {
   const headers = corsHeaders(request, env);
   const auth = await requireAssetManagerApiAuth(request, env, headers);
   if (!auth.ok) return auth.response;
+  const demo = await demoSessionForRequest(env, request, headers, { cloneSeedAssets: true });
 
   try {
     const body = (await request.json()) as { ids?: string[]; permanent?: boolean };
@@ -37,8 +39,16 @@ export async function POST(request: Request) {
     }
 
     const result = body.permanent
-      ? await bulkDeleteAssetsPermanently(env, ids)
-      : await bulkSoftDeleteAssets(env, ids);
+      ? await bulkDeleteAssetsPermanently(
+          env,
+          ids,
+          demo.enabled && demo.sessionId ? { demoSessionId: demo.sessionId } : undefined,
+        )
+      : await bulkSoftDeleteAssets(
+          env,
+          ids,
+          demo.enabled && demo.sessionId ? { demoSessionId: demo.sessionId } : undefined,
+        );
 
     return jsonResponse(
       {

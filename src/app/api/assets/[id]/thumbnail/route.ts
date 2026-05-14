@@ -1,5 +1,6 @@
 import {
   corsHeaders,
+  demoSessionForRequest,
   errorResponse,
   getAssetById,
   jsonResponse,
@@ -28,11 +29,13 @@ export async function PUT(request: Request, { params }: Params) {
   const headers = corsHeaders(request, env);
   const auth = await requireAssetManagerApiAuth(request, env, headers);
   if (!auth.ok) return auth.response;
+  const demo = await demoSessionForRequest(env, request, headers, { cloneSeedAssets: true });
+  const scope = demo.enabled && demo.sessionId ? { demoSessionId: demo.sessionId } : undefined;
 
   const { id } = await params;
 
   try {
-    const row = await getAssetById(env, id);
+    const row = await getAssetById(env, id, scope);
     if (!row) {
       return errorResponse("Asset not found.", 404, { headers });
     }

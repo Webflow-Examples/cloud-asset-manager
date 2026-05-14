@@ -6,7 +6,9 @@ import {
   errorResponse,
   getAssetById,
   jsonResponse,
+  noteDemoAssetStorageChanged,
   optionsResponse,
+  optionalDemoSessionForRequest,
   rowToAsset,
   validateContentSha256,
 } from "@/lib/asset-storage";
@@ -29,6 +31,8 @@ export async function PUT(request: Request, { params }: Params) {
   const headers = corsHeaders(request, env);
   const auth = await requireAssetManagerApiAuth(request, env, headers);
   if (!auth.ok) return auth.response;
+  const demo = await optionalDemoSessionForRequest(env, request);
+  const scope = demo.enabled ? { demoSessionId: demo.sessionId || "__missing_demo_session__" } : undefined;
 
   const { id } = await params;
   const url = new URL(request.url);
@@ -43,7 +47,7 @@ export async function PUT(request: Request, { params }: Params) {
     return errorResponse(`Part number exceeds maximum of ${MAX_MULTIPART_PARTS}.`, 400, { headers });
   }
 
-  const row = await getAssetById(env, id);
+  const row = await getAssetById(env, id, scope);
   if (!row) {
     return errorResponse("Asset upload not found.", 404, { headers });
   }
@@ -74,6 +78,8 @@ export async function POST(request: Request, { params }: Params) {
   const headers = corsHeaders(request, env);
   const auth = await requireAssetManagerApiAuth(request, env, headers);
   if (!auth.ok) return auth.response;
+  const demo = await optionalDemoSessionForRequest(env, request);
+  const scope = demo.enabled ? { demoSessionId: demo.sessionId || "__missing_demo_session__" } : undefined;
 
   const { id } = await params;
 
@@ -88,7 +94,7 @@ export async function POST(request: Request, { params }: Params) {
       return errorResponse("Upload ID and uploaded parts are required.", 400, { headers });
     }
 
-    const row = await getAssetById(env, id);
+    const row = await getAssetById(env, id, scope);
     if (!row) {
       return errorResponse("Asset upload not found.", 404, { headers });
     }
@@ -113,13 +119,14 @@ export async function POST(request: Request, { params }: Params) {
       )
       .run();
 
-    const completedRow = await getAssetById(env, id);
+    const completedRow = await getAssetById(env, id, scope);
     if (!completedRow) {
       return errorResponse("Upload completed, but the asset index could not be read.", 500, {
         headers,
       });
     }
 
+    await noteDemoAssetStorageChanged(env, completedRow);
     return jsonResponse({ asset: rowToAsset(completedRow, request) }, { headers });
   } catch (error) {
     return errorResponse(
@@ -135,6 +142,8 @@ export async function DELETE(request: Request, { params }: Params) {
   const headers = corsHeaders(request, env);
   const auth = await requireAssetManagerApiAuth(request, env, headers);
   if (!auth.ok) return auth.response;
+  const demo = await optionalDemoSessionForRequest(env, request);
+  const scope = demo.enabled ? { demoSessionId: demo.sessionId || "__missing_demo_session__" } : undefined;
 
   const { id } = await params;
   const url = new URL(request.url);
@@ -144,7 +153,7 @@ export async function DELETE(request: Request, { params }: Params) {
     return errorResponse("Upload ID is required.", 400, { headers });
   }
 
-  const row = await getAssetById(env, id);
+  const row = await getAssetById(env, id, scope);
   if (!row) {
     return errorResponse("Asset upload not found.", 404, { headers });
   }
@@ -158,6 +167,7 @@ export async function DELETE(request: Request, { params }: Params) {
     )
       .bind(new Date().toISOString(), id)
       .run();
+    await noteDemoAssetStorageChanged(env, row);
 
     return new Response(null, { status: 204, headers });
   } catch (error) {

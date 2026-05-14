@@ -1,6 +1,12 @@
 import { getAssetManagerEnv } from "@/lib/cloudflare";
 import { requireAssetManagerApiAuth } from "@/lib/auth-gate";
-import { corsHeaders, jsonResponse, optionsResponse, runtimeConfig } from "@/lib/asset-storage";
+import {
+  corsHeaders,
+  demoSessionForRequest,
+  jsonResponse,
+  optionsResponse,
+  runtimeConfig,
+} from "@/lib/asset-storage";
 
 export const dynamic = "force-dynamic";
 
@@ -14,6 +20,7 @@ export async function GET(request: Request) {
   const headers = corsHeaders(request, env);
   const auth = await requireAssetManagerApiAuth(request, env, headers);
   if (!auth.ok) return auth.response;
+  await demoSessionForRequest(env, request, headers);
 
   return jsonResponse(await runtimeConfig(request, env), {
     headers,

@@ -2,6 +2,7 @@ import { getAssetManagerEnv } from "@/lib/cloudflare";
 import { requireAssetManagerApiAuth } from "@/lib/auth-gate";
 import {
   corsHeaders,
+  demoSessionForRequest,
   errorResponse,
   getAssetManagerSettings,
   jsonResponse,
@@ -21,6 +22,7 @@ export async function GET(request: Request) {
   const headers = corsHeaders(request, env);
   const auth = await requireAssetManagerApiAuth(request, env, headers);
   if (!auth.ok) return auth.response;
+  await demoSessionForRequest(env, request, headers);
 
   return jsonResponse(await getAssetManagerSettings(env), {
     headers,
@@ -32,6 +34,14 @@ export async function PATCH(request: Request) {
   const headers = corsHeaders(request, env);
   const auth = await requireAssetManagerApiAuth(request, env, headers);
   if (!auth.ok) return auth.response;
+  const demo = await demoSessionForRequest(env, request, headers);
+  if (demo.enabled) {
+    return errorResponse(
+      "Settings are read-only in the public demo. A production deployment can change delivery and cache settings.",
+      403,
+      { headers },
+    );
+  }
 
   // TIP: Add role checks here to restrict settings access to admins.
   // Example: if (!auth.session?.canManageSettings) {

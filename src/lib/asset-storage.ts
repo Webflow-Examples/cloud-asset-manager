@@ -5,7 +5,17 @@ import {
   MULTIPART_PART_SIZE_BYTES,
   OBJECT_KEY_PREFIX,
   WEBFLOW_LIMITS,
+  formatBytes,
 } from "@/lib/asset-limits";
+import {
+  demoModeEnabled,
+  demoRuntimeConfig,
+  demoSeedObjectKey,
+  demoSessionCookie,
+  demoSessionIdFromRequest,
+  demoThumbnailKey,
+  validateDemoUploadFile,
+} from "@/lib/asset-demo";
 import { getAssetManagerAuthUi } from "@/lib/auth-ui";
 import { assetCacheBustedUrl, assetStableUrl } from "@/lib/asset-url";
 import type {
@@ -27,6 +37,7 @@ const THUMBNAIL_OBJECT_PREFIX = `${OBJECT_KEY_PREFIX}/thumbnails/`;
 const MAX_ASSET_SLUG_LENGTH = 180;
 const PURGE_EXPIRED_DELETED_INTERVAL_MS = 5 * 60 * 1000;
 const RECONCILE_BUCKET_INTERVAL_MS = 60 * 1000;
+const DEMO_CLEANUP_INTERVAL_MS = 60 * 1000;
 const USAGE_KINDS: Asset["kind"][] = [
   "image",
   "video",
@@ -39,7 +50,10 @@ const USAGE_KINDS: Asset["kind"][] = [
 const THUMBNAIL_SOURCE_KINDS: Asset["kind"][] = ["image", "video", "pdf"];
 
 function processEnv(
-  name: "ASSET_MANAGER_AUTH_ENABLED" | "ASSET_MANAGER_PROTECT_ASSET_DELIVERY",
+  name:
+    | "ASSET_MANAGER_AUTH_ENABLED"
+    | "ASSET_MANAGER_PROTECT_ASSET_DELIVERY"
+    | "ASSET_MANAGER_DEMO_MODE",
 ) {
   return typeof process === "undefined" ? undefined : process.env[name];
 }
@@ -86,7 +100,11 @@ function assetColumnSelect(alias = "assets") {
     ${alias}.updated_at,
     ${alias}.deleted_at,
     ${alias}.delete_after,
-    ${alias}.status
+    ${alias}.status,
+    ${alias}.demo_session_id,
+    ${alias}.demo_seed_asset_id,
+    ${alias}.demo_storage_owner,
+    ${alias}.demo_expires_at
   `;
 }
 
@@ -132,7 +150,11 @@ CREATE TABLE IF NOT EXISTS assets (
   updated_at TEXT NOT NULL,
   deleted_at TEXT,
   delete_after TEXT,
-  status TEXT NOT NULL DEFAULT 'ready' CHECK (status IN ('uploading', 'ready', 'failed'))
+  status TEXT NOT NULL DEFAULT 'ready' CHECK (status IN ('uploading', 'ready', 'failed')),
+  demo_session_id TEXT NOT NULL DEFAULT '',
+  demo_seed_asset_id TEXT,
+  demo_storage_owner TEXT NOT NULL DEFAULT 'seed' CHECK (demo_storage_owner IN ('seed', 'demo')),
+  demo_expires_at TEXT
 );
 CREATE TABLE IF NOT EXISTS asset_tags (
   asset_id TEXT NOT NULL,
@@ -144,6 +166,23 @@ CREATE TABLE IF NOT EXISTS asset_manager_settings (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL,
   updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS demo_sessions (
+  id TEXT PRIMARY KEY,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  uploaded_bytes INTEGER NOT NULL DEFAULT 0,
+  uploaded_asset_count INTEGER NOT NULL DEFAULT 0,
+  seed_cloned_at TEXT,
+  cleanup_started_at TEXT
+);
+CREATE TABLE IF NOT EXISTS demo_asset_tombstones (
+  demo_session_id TEXT NOT NULL,
+  seed_asset_id TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (demo_session_id, seed_asset_id),
+  FOREIGN KEY (demo_session_id) REFERENCES demo_sessions(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS assets_display_name_idx ON assets (display_name);
 CREATE INDEX IF NOT EXISTS assets_original_filename_idx ON assets (original_filename);
@@ -169,11 +208,13 @@ const maintenanceState = new WeakMap<
   {
     purgeAt: number;
     reconcileAt: number;
+    demoCleanupAt: number;
   }
 >();
 const sharedMaintenanceState = {
   purgeAt: 0,
   reconcileAt: 0,
+  demoCleanupAt: 0,
 };
 
 type AssetColumnMigration = readonly [column: string, statement: string];
@@ -218,10 +259,18 @@ const ASSET_COLUMN_MIGRATIONS = [
     "thumbnail_medium_updated_at",
     "ALTER TABLE assets ADD COLUMN thumbnail_medium_updated_at TEXT",
   ],
+  ["demo_session_id", "ALTER TABLE assets ADD COLUMN demo_session_id TEXT NOT NULL DEFAULT ''"],
+  ["demo_seed_asset_id", "ALTER TABLE assets ADD COLUMN demo_seed_asset_id TEXT"],
+  [
+    "demo_storage_owner",
+    "ALTER TABLE assets ADD COLUMN demo_storage_owner TEXT NOT NULL DEFAULT 'seed'",
+  ],
+  ["demo_expires_at", "ALTER TABLE assets ADD COLUMN demo_expires_at TEXT"],
 ] as const satisfies readonly AssetColumnMigration[];
 
 const POST_SCHEMA_INDEX_SQL = [
-  "CREATE UNIQUE INDEX IF NOT EXISTS assets_slug_idx ON assets (slug)",
+  "DROP INDEX IF EXISTS assets_slug_idx",
+  "CREATE UNIQUE INDEX IF NOT EXISTS assets_slug_scope_idx ON assets (demo_session_id, slug)",
   "CREATE INDEX IF NOT EXISTS assets_thumbnail_key_idx ON assets (thumbnail_key)",
   "CREATE INDEX IF NOT EXISTS assets_content_sha256_idx ON assets (content_sha256)",
   "CREATE INDEX IF NOT EXISTS assets_thumbnail_tiny_key_idx ON assets (thumbnail_tiny_key)",
@@ -229,6 +278,10 @@ const POST_SCHEMA_INDEX_SQL = [
   "CREATE INDEX IF NOT EXISTS assets_status_deleted_uploaded_idx ON assets (status, deleted_at, uploaded_at DESC)",
   "CREATE INDEX IF NOT EXISTS assets_status_size_idx ON assets (status, size_bytes DESC)",
   "CREATE INDEX IF NOT EXISTS assets_content_sha256_status_uploaded_idx ON assets (content_sha256, status, uploaded_at DESC)",
+  "CREATE INDEX IF NOT EXISTS assets_demo_session_idx ON assets (demo_session_id)",
+  "CREATE INDEX IF NOT EXISTS assets_demo_seed_asset_idx ON assets (demo_seed_asset_id)",
+  "CREATE INDEX IF NOT EXISTS assets_demo_expires_at_idx ON assets (demo_expires_at)",
+  "CREATE INDEX IF NOT EXISTS demo_sessions_expires_at_idx ON demo_sessions (expires_at)",
   "CREATE INDEX IF NOT EXISTS asset_tags_tag_asset_id_idx ON asset_tags (tag, asset_id)",
 ] as const;
 
@@ -276,6 +329,409 @@ export function optionsResponse(request: Request, env?: Partial<AssetManagerEnv>
     status: 204,
     headers: corsHeaders(request, env),
   });
+}
+
+export type AssetScope = {
+  demoSessionId?: string | null;
+};
+
+export type DemoSessionContext = {
+  enabled: boolean;
+  sessionId: string | null;
+  expiresAt: string | null;
+};
+
+type DemoSessionRow = {
+  id: string;
+  expires_at: string;
+  seed_cloned_at: string | null;
+};
+
+function scopeId(scope?: AssetScope) {
+  return scope?.demoSessionId || "";
+}
+
+function addSetCookie(headers: HeadersInit, value: string) {
+  if (headers instanceof Headers) {
+    headers.set("Set-Cookie", value);
+    return;
+  }
+
+  if (Array.isArray(headers)) {
+    headers.push(["Set-Cookie", value]);
+    return;
+  }
+
+  (headers as Record<string, string>)["Set-Cookie"] = value;
+}
+
+function demoExpiryFromNow(env: Partial<AssetManagerEnv>) {
+  const ttlMs = demoRuntimeConfig(env).sessionTtlHours * 60 * 60 * 1000;
+  return new Date(Date.now() + ttlMs).toISOString();
+}
+
+function validDemoSession(row: DemoSessionRow | null) {
+  return Boolean(row && new Date(row.expires_at).getTime() > Date.now());
+}
+
+async function getDemoSessionRow(env: AssetManagerEnv, sessionId: string | null) {
+  if (!sessionId) return null;
+  await ensureAssetSchema(env.ASSET_INDEX);
+  return env.ASSET_INDEX.prepare(
+    `SELECT id, expires_at, seed_cloned_at
+     FROM demo_sessions
+     WHERE id = ?`,
+  )
+    .bind(sessionId)
+    .first<DemoSessionRow>();
+}
+
+async function createDemoSession(env: AssetManagerEnv) {
+  await ensureAssetSchema(env.ASSET_INDEX);
+  const now = new Date().toISOString();
+  const session: DemoSessionRow = {
+    id: crypto.randomUUID(),
+    expires_at: demoExpiryFromNow(env),
+    seed_cloned_at: null,
+  };
+
+  await env.ASSET_INDEX.prepare(
+    `INSERT INTO demo_sessions (
+       id,
+       created_at,
+       updated_at,
+       expires_at,
+       uploaded_bytes,
+       uploaded_asset_count
+     ) VALUES (?, ?, ?, ?, 0, 0)`,
+  )
+    .bind(session.id, now, now, session.expires_at)
+    .run();
+
+  return session;
+}
+
+export async function optionalDemoSessionForRequest(
+  env: AssetManagerEnv,
+  request: Request,
+): Promise<DemoSessionContext> {
+  if (!demoModeEnabled(env)) {
+    return { enabled: false, sessionId: null, expiresAt: null };
+  }
+
+  const row = await getDemoSessionRow(env, demoSessionIdFromRequest(request));
+  if (!validDemoSession(row)) {
+    return { enabled: true, sessionId: null, expiresAt: null };
+  }
+
+  return { enabled: true, sessionId: row!.id, expiresAt: row!.expires_at };
+}
+
+export async function demoSessionForRequest(
+  env: AssetManagerEnv,
+  request: Request,
+  responseHeaders: HeadersInit,
+  options: { cloneSeedAssets?: boolean } = {},
+): Promise<DemoSessionContext> {
+  if (!demoModeEnabled(env)) {
+    return { enabled: false, sessionId: null, expiresAt: null };
+  }
+
+  await maybeCleanupExpiredDemoSessions(env);
+
+  let row = await getDemoSessionRow(env, demoSessionIdFromRequest(request));
+  if (!validDemoSession(row)) {
+    row = await createDemoSession(env);
+    addSetCookie(responseHeaders, demoSessionCookie(request, row.id, row.expires_at));
+  }
+
+  if (options.cloneSeedAssets) {
+    await cloneSeedAssetsForDemoSession(env, row!.id);
+  }
+
+  return { enabled: true, sessionId: row!.id, expiresAt: row!.expires_at };
+}
+
+async function syncDemoSessionUsage(env: AssetManagerEnv, sessionId: string) {
+  const row = await env.ASSET_INDEX.prepare(
+    `SELECT COALESCE(SUM(size_bytes), 0) AS bytes,
+            COUNT(*) AS count
+     FROM assets
+     WHERE demo_session_id = ?
+       AND demo_storage_owner = 'demo'
+       AND status != 'failed'`,
+  )
+    .bind(sessionId)
+    .first<{ bytes: number; count: number }>();
+
+  await env.ASSET_INDEX.prepare(
+    `UPDATE demo_sessions
+     SET uploaded_bytes = ?,
+         uploaded_asset_count = ?,
+         updated_at = ?
+     WHERE id = ?`,
+  )
+    .bind(Number(row?.bytes || 0), Number(row?.count || 0), new Date().toISOString(), sessionId)
+    .run();
+}
+
+export async function assertDemoSessionCapacity(
+  env: AssetManagerEnv,
+  sessionId: string | null | undefined,
+  nextFileBytes: number,
+  options: { replacingAsset?: AssetRow | null } = {},
+) {
+  if (!demoModeEnabled(env) || !sessionId) return;
+
+  const config = demoRuntimeConfig(env);
+  const usage = await env.ASSET_INDEX.prepare(
+    `SELECT COALESCE(SUM(size_bytes), 0) AS bytes,
+            COUNT(*) AS count
+     FROM assets
+     WHERE demo_session_id = ?
+       AND demo_storage_owner = 'demo'
+       AND status != 'failed'`,
+  )
+    .bind(sessionId)
+    .first<{ bytes: number; count: number }>();
+  const currentBytes = Number(usage?.bytes || 0);
+  const currentCount = Number(usage?.count || 0);
+  const replacingDemoAsset = options.replacingAsset?.demo_storage_owner === "demo";
+  const replacedBytes = replacingDemoAsset ? Number(options.replacingAsset?.size_bytes || 0) : 0;
+  const nextBytes = currentBytes - replacedBytes + nextFileBytes;
+  const nextCount = currentCount + (replacingDemoAsset ? 0 : 1);
+
+  if (nextFileBytes > config.maxFileBytes) {
+    validateDemoUploadFile(env, {
+      filename: options.replacingAsset?.original_filename || "asset",
+      contentType: options.replacingAsset?.content_type || "application/octet-stream",
+      sizeBytes: nextFileBytes,
+    });
+  }
+
+  if (nextBytes > config.maxSessionBytes) {
+    throw new Error(
+      `This upload would exceed the public demo session limit of ${formatBytes(config.maxSessionBytes)}. A production deployment can allow more storage.`,
+    );
+  }
+
+  if (nextCount > config.maxSessionAssets) {
+    throw new Error(
+      `This upload would exceed the public demo limit of ${config.maxSessionAssets} assets per session. A production deployment can allow more assets.`,
+    );
+  }
+}
+
+export async function noteDemoAssetStorageChanged(env: AssetManagerEnv, row: AssetRow | null) {
+  if (row?.demo_session_id) {
+    await syncDemoSessionUsage(env, row.demo_session_id);
+  }
+}
+
+async function cloneSeedAssetsForDemoSession(env: AssetManagerEnv, sessionId: string) {
+  const session = await getDemoSessionRow(env, sessionId);
+  if (!session || session.seed_cloned_at) return;
+
+  const now = new Date().toISOString();
+  const seedRows = await env.ASSET_INDEX.prepare(
+    `SELECT ${assetColumnSelect("assets")}
+     FROM assets
+     WHERE assets.demo_session_id = ''
+       AND assets.status = 'ready'
+       AND assets.deleted_at IS NULL
+       AND NOT EXISTS (
+         SELECT 1
+         FROM demo_asset_tombstones
+         WHERE demo_asset_tombstones.demo_session_id = ?
+           AND demo_asset_tombstones.seed_asset_id = assets.id
+       )
+     ORDER BY datetime(assets.uploaded_at) DESC
+     LIMIT 500`,
+  )
+    .bind(sessionId)
+    .all<AssetRow>();
+
+  for (const seed of seedRows.results || []) {
+    const cloneId = `demo-${sessionId}-${seed.id}`;
+    await env.ASSET_INDEX.prepare(
+      `INSERT OR IGNORE INTO assets (
+         id,
+         slug,
+         object_key,
+         display_name,
+         original_filename,
+         content_type,
+         size_bytes,
+         etag,
+         content_sha256,
+         thumbnail_key,
+         thumbnail_content_type,
+         thumbnail_size_bytes,
+         thumbnail_etag,
+         thumbnail_updated_at,
+         thumbnail_tiny_key,
+         thumbnail_tiny_content_type,
+         thumbnail_tiny_size_bytes,
+         thumbnail_tiny_etag,
+         thumbnail_tiny_updated_at,
+         thumbnail_medium_key,
+         thumbnail_medium_content_type,
+         thumbnail_medium_size_bytes,
+         thumbnail_medium_etag,
+         thumbnail_medium_updated_at,
+         folder,
+         cache_policy,
+         cache_version,
+         allowed_origins,
+         inherit_allowed_origins,
+         uploaded_at,
+         updated_at,
+         deleted_at,
+         delete_after,
+         status,
+         demo_session_id,
+         demo_seed_asset_id,
+         demo_storage_owner,
+         demo_expires_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, 'ready', ?, ?, 'seed', ?)`,
+    )
+      .bind(
+        cloneId,
+        seed.slug,
+        demoSeedObjectKey(sessionId, seed.id),
+        seed.display_name,
+        seed.original_filename,
+        seed.content_type,
+        seed.size_bytes,
+        seed.etag,
+        seed.content_sha256,
+        seed.thumbnail_key,
+        seed.thumbnail_content_type,
+        seed.thumbnail_size_bytes,
+        seed.thumbnail_etag,
+        seed.thumbnail_updated_at,
+        seed.thumbnail_tiny_key,
+        seed.thumbnail_tiny_content_type,
+        seed.thumbnail_tiny_size_bytes,
+        seed.thumbnail_tiny_etag,
+        seed.thumbnail_tiny_updated_at,
+        seed.thumbnail_medium_key,
+        seed.thumbnail_medium_content_type,
+        seed.thumbnail_medium_size_bytes,
+        seed.thumbnail_medium_etag,
+        seed.thumbnail_medium_updated_at,
+        seed.folder,
+        seed.cache_policy,
+        seed.cache_version,
+        seed.allowed_origins,
+        seed.inherit_allowed_origins,
+        seed.uploaded_at,
+        now,
+        sessionId,
+        seed.id,
+        session.expires_at,
+      )
+      .run();
+
+    const tags = await env.ASSET_INDEX.prepare(
+      `SELECT tag
+       FROM asset_tags
+       WHERE asset_id = ?`,
+    )
+      .bind(seed.id)
+      .all<{ tag: string }>();
+
+    if (tags.results?.length) {
+      await env.ASSET_INDEX.batch(
+        tags.results.map((tag) =>
+          env.ASSET_INDEX.prepare(
+            "INSERT OR IGNORE INTO asset_tags (asset_id, tag) VALUES (?, ?)",
+          ).bind(cloneId, tag.tag),
+        ),
+      );
+    }
+  }
+
+  await env.ASSET_INDEX.prepare(
+    `UPDATE demo_sessions
+     SET seed_cloned_at = ?,
+         updated_at = ?
+     WHERE id = ?`,
+  )
+    .bind(now, now, sessionId)
+    .run();
+}
+
+async function maybeCleanupExpiredDemoSessions(env: AssetManagerEnv) {
+  const state = assetMaintenanceState(env.ASSET_INDEX);
+  const now = Date.now();
+  if (now - state.demoCleanupAt < DEMO_CLEANUP_INTERVAL_MS) return;
+
+  await cleanupExpiredDemoSessions(env);
+  state.demoCleanupAt = Date.now();
+}
+
+export async function cleanupExpiredDemoSessions(env: AssetManagerEnv) {
+  await ensureAssetSchema(env.ASSET_INDEX);
+  const now = new Date().toISOString();
+  const expired = await env.ASSET_INDEX.prepare(
+    `SELECT id
+     FROM demo_sessions
+     WHERE expires_at <= ?
+     ORDER BY expires_at
+     LIMIT 10`,
+  )
+    .bind(now)
+    .all<{ id: string }>();
+
+  for (const session of expired.results || []) {
+    const demoRows = await env.ASSET_INDEX.prepare(
+      `SELECT id,
+              object_key,
+              thumbnail_key,
+              thumbnail_tiny_key,
+              thumbnail_medium_key,
+              demo_storage_owner
+       FROM assets
+       WHERE demo_session_id = ?
+         AND demo_storage_owner = 'demo'
+       LIMIT 100`,
+    )
+      .bind(session.id)
+      .all<
+        Pick<
+          AssetRow,
+          | "id"
+          | "object_key"
+          | "thumbnail_key"
+          | "thumbnail_tiny_key"
+          | "thumbnail_medium_key"
+          | "demo_storage_owner"
+        >
+      >();
+
+    for (const row of demoRows.results || []) {
+      await env.CLOUD_ASSETS.delete(row.object_key).catch(() => undefined);
+      const thumbnailKeys = thumbnailKeysFor(row);
+      if (thumbnailKeys.length) {
+        await deleteThumbnailObjects(env, thumbnailKeys).catch(() => undefined);
+      }
+    }
+
+    await env.ASSET_INDEX.prepare(
+      `DELETE FROM asset_tags
+       WHERE asset_id IN (SELECT id FROM assets WHERE demo_session_id = ?)`,
+    )
+      .bind(session.id)
+      .run();
+    await env.ASSET_INDEX.prepare("DELETE FROM assets WHERE demo_session_id = ?")
+      .bind(session.id)
+      .run();
+    await env.ASSET_INDEX.prepare("DELETE FROM demo_asset_tombstones WHERE demo_session_id = ?")
+      .bind(session.id)
+      .run();
+    await env.ASSET_INDEX.prepare("DELETE FROM demo_sessions WHERE id = ?").bind(session.id).run();
+  }
 }
 
 const SETTING_KEYS = [
@@ -619,12 +1075,13 @@ export async function runtimeConfig(
   request: Request,
   env: Partial<AssetManagerEnv> & { ASSET_INDEX: D1Database },
 ) {
+  const demo = demoRuntimeConfig(env);
   return {
     appBasePath: APP_BASE_PATH,
     uploadBaseUrl: getUploadBaseUrl(request, env),
     directUploadLimitBytes: DIRECT_UPLOAD_LIMIT_BYTES,
     multipartPartSizeBytes: MULTIPART_PART_SIZE_BYTES,
-    maxMultipartUploadBytes: MAX_MULTIPART_UPLOAD_BYTES,
+    maxMultipartUploadBytes: demo.enabled ? demo.maxFileBytes : MAX_MULTIPART_UPLOAD_BYTES,
     settings: await getAssetManagerSettings(env),
     access: {
       interfaceAuthEnabled: accessFlag(
@@ -639,6 +1096,7 @@ export async function runtimeConfig(
       adapterPath: "src/lib/auth.ts" as const,
     },
     authUi: getAssetManagerAuthUi(env),
+    demo,
   };
 }
 
@@ -716,25 +1174,34 @@ function slugWithSuffix(slug: string, suffix: string) {
 async function assetSlugAvailable(
   env: AssetManagerEnv,
   slug: string,
-  options: { excludeId?: string } = {},
+  options: { excludeId?: string; scope?: AssetScope } = {},
 ) {
   await ensureAssetSchema(env.ASSET_INDEX);
+  const currentScopeId = scopeId(options.scope);
 
   const row = options.excludeId
-    ? await env.ASSET_INDEX.prepare("SELECT id FROM assets WHERE slug = ? AND id != ?")
-        .bind(slug, options.excludeId)
+    ? await env.ASSET_INDEX.prepare(
+        "SELECT id FROM assets WHERE demo_session_id = ? AND slug = ? AND id != ?",
+      )
+        .bind(currentScopeId, slug, options.excludeId)
         .first<{ id: string }>()
-    : await env.ASSET_INDEX.prepare("SELECT id FROM assets WHERE slug = ?")
-        .bind(slug)
+    : await env.ASSET_INDEX.prepare(
+        "SELECT id FROM assets WHERE demo_session_id = ? AND slug = ?",
+      )
+        .bind(currentScopeId, slug)
         .first<{ id: string }>();
 
   return !row;
 }
 
-export async function createUniqueAssetSlug(env: AssetManagerEnv, filename: string) {
+export async function createUniqueAssetSlug(
+  env: AssetManagerEnv,
+  filename: string,
+  options: { scope?: AssetScope } = {},
+) {
   const baseSlug = normalizeAssetSlug(filename);
 
-  if (await assetSlugAvailable(env, baseSlug)) {
+  if (await assetSlugAvailable(env, baseSlug, { scope: options.scope })) {
     return baseSlug;
   }
 
@@ -742,7 +1209,7 @@ export async function createUniqueAssetSlug(env: AssetManagerEnv, filename: stri
     const suffix = crypto.randomUUID().replace(/-/g, "").slice(0, 8);
     const candidate = slugWithSuffix(baseSlug, suffix);
 
-    if (await assetSlugAvailable(env, candidate)) {
+    if (await assetSlugAvailable(env, candidate, { scope: options.scope })) {
       return candidate;
     }
   }
@@ -753,7 +1220,7 @@ export async function createUniqueAssetSlug(env: AssetManagerEnv, filename: stri
 export async function validateUniqueAssetSlug(
   env: AssetManagerEnv,
   value: unknown,
-  options: { excludeId?: string } = {},
+  options: { excludeId?: string; scope?: AssetScope } = {},
 ) {
   const slug = normalizeAssetSlug(value);
 
@@ -766,12 +1233,24 @@ export async function validateUniqueAssetSlug(
 
 export type ThumbnailVariant = "tiny" | "medium";
 
-export function createThumbnailKey(id: string, variant: ThumbnailVariant) {
+export function createThumbnailKey(
+  id: string,
+  variant: ThumbnailVariant,
+  options: { demoSessionId?: string | null } = {},
+) {
+  if (options.demoSessionId) {
+    return demoThumbnailKey(options.demoSessionId, id, variant);
+  }
+
   return `${THUMBNAIL_OBJECT_PREFIX}${id}-${variant}.webp`;
 }
 
 function isThumbnailObjectKey(key: string) {
   return key.startsWith(THUMBNAIL_OBJECT_PREFIX);
+}
+
+function isDemoObjectKey(key: string) {
+  return key.startsWith("demo-sessions/") || key.startsWith("demo-seed/");
 }
 
 export function validateDisplayName(value: unknown) {
@@ -946,12 +1425,13 @@ export function validateReplacementAsset(
   row: AssetRow,
   originalFilename: string,
   contentType: string,
+  options: { allowUploading?: boolean } = {},
 ) {
   if (row.deleted_at) {
     throw new Error("Restore this asset before replacing its file.");
   }
 
-  if (row.status !== "ready") {
+  if (row.status !== "ready" && !(options.allowUploading && row.status === "uploading")) {
     throw new Error("Only ready assets can be replaced.");
   }
 
@@ -1004,6 +1484,10 @@ function thumbnailUrl(
     v: thumbnailVersion,
   });
 
+  if (row.demo_session_id) {
+    params.set("demo", "1");
+  }
+
   return `${origin}${APP_BASE_PATH}/thumbnails/${encodeURIComponent(row.id)}?${params.toString()}`;
 }
 
@@ -1044,7 +1528,8 @@ export async function deleteThumbnailObjects(env: AssetManagerEnv, keys: string[
 export function rowToAsset(row: AssetRow, request: Request): Asset {
   const origin = new URL(request.url).origin;
   const cacheVersion = row.cache_version || 1;
-  const stableUrl = assetStableUrl(row.slug || row.id, origin);
+  const baseStableUrl = assetStableUrl(row.slug || row.id, origin);
+  const stableUrl = row.demo_session_id ? `${baseStableUrl}?demo=1` : baseStableUrl;
   const allowedOrigins = storedAssetAllowedOrigins(row.allowed_origins);
   const thumbnailVersion =
     row.thumbnail_medium_updated_at ||
@@ -1079,15 +1564,27 @@ export function rowToAsset(row: AssetRow, request: Request): Asset {
     deleteAfter: row.delete_after,
     status: row.status,
     url: stableUrl,
-    cacheBustedUrl: assetCacheBustedUrl(row.slug || row.id, cacheVersion, origin),
+    cacheBustedUrl: row.demo_session_id
+      ? `${assetCacheBustedUrl(row.slug || row.id, cacheVersion, origin)}&demo=1`
+      : assetCacheBustedUrl(row.slug || row.id, cacheVersion, origin),
     kind: assetKind(row.content_type, row.original_filename),
+    demoSessionId: row.demo_session_id || null,
   };
 }
 
 export async function updateAssetFileMetadata(
   env: AssetManagerEnv,
   row: Pick<AssetRow, "id"> &
-    Partial<Pick<AssetRow, "thumbnail_key" | "thumbnail_tiny_key" | "thumbnail_medium_key">>,
+    Partial<
+      Pick<
+        AssetRow,
+        | "thumbnail_key"
+        | "thumbnail_tiny_key"
+        | "thumbnail_medium_key"
+        | "demo_storage_owner"
+        | "demo_session_id"
+      >
+    >,
   file: {
     originalFilename: string;
     contentType: string;
@@ -1095,18 +1592,24 @@ export async function updateAssetFileMetadata(
     etag: string | null;
     contentSha256?: string | null;
     updatedAt?: string;
+    objectKey?: string;
+    demoStorageOwner?: "seed" | "demo";
   },
 ) {
   const updatedAt = file.updatedAt || new Date().toISOString();
 
   const thumbnailKeys = thumbnailKeysFor(row);
-  if (thumbnailKeys.length) {
+  if (
+    thumbnailKeys.length &&
+    (!("demo_storage_owner" in row) || row.demo_storage_owner !== "seed")
+  ) {
     await deleteThumbnailObjects(env, thumbnailKeys);
   }
 
   await env.ASSET_INDEX.prepare(
     `UPDATE assets
-     SET original_filename = ?,
+     SET object_key = COALESCE(?, object_key),
+         original_filename = ?,
          content_type = ?,
          size_bytes = ?,
          etag = ?,
@@ -1127,22 +1630,25 @@ export async function updateAssetFileMetadata(
          thumbnail_medium_etag = NULL,
          thumbnail_medium_updated_at = NULL,
          cache_version = cache_version + 1,
+         demo_storage_owner = COALESCE(?, demo_storage_owner),
          updated_at = ?,
          status = 'ready'
      WHERE id = ?`,
   )
     .bind(
+      file.objectKey || null,
       file.originalFilename,
       file.contentType,
       file.sizeBytes,
       file.etag,
       file.contentSha256 || null,
+      file.demoStorageOwner || null,
       updatedAt,
       row.id,
     )
     .run();
 
-  return getAssetById(env, row.id);
+  return getAssetById(env, row.id, { demoSessionId: row.demo_session_id || "" });
 }
 
 export async function putAssetThumbnails(
@@ -1190,7 +1696,9 @@ export async function putAssetThumbnails(
     if (!file) continue;
 
     const contentType = validateThumbnailFile(file);
-    const thumbnailKey = createThumbnailKey(row.id, variant);
+    const thumbnailKey = createThumbnailKey(row.id, variant, {
+      demoSessionId: row.demo_storage_owner === "demo" ? row.demo_session_id : null,
+    });
     const object = await putThumbnailObject(env, thumbnailKey, await file.arrayBuffer(), {
       httpMetadata: {
         contentType,
@@ -1249,7 +1757,7 @@ export async function putAssetThumbnails(
     )
     .run();
 
-  return getAssetById(env, row.id);
+  return getAssetById(env, row.id, { demoSessionId: row.demo_session_id || "" });
 }
 
 export async function hashObjectKey(key: string) {
@@ -1289,7 +1797,9 @@ export async function reconcileBucketObjects(env: AssetManagerEnv) {
   await pruneIndexedThumbnailObjects(env);
 
   const listed = await env.CLOUD_ASSETS.list({ limit: 200 });
-  const objects = listed.objects.filter((object) => !isThumbnailObjectKey(object.key));
+  const objects = listed.objects.filter(
+    (object) => !isThumbnailObjectKey(object.key) && !isDemoObjectKey(object.key),
+  );
   const existingKeys = await existingAssetObjectKeys(env, objects.map((object) => object.key));
   const now = new Date().toISOString();
 
@@ -1425,7 +1935,7 @@ async function tagsForAssetIds(env: AssetManagerEnv, assetIds: string[]) {
   return tags;
 }
 
-export async function listAssets(env: AssetManagerEnv, request: Request) {
+export async function listAssets(env: AssetManagerEnv, request: Request, scope?: AssetScope) {
   const url = new URL(request.url);
   const query = (url.searchParams.get("q") || "").trim();
   const folder = validateFolder(url.searchParams.get("folder")) || "";
@@ -1440,6 +1950,7 @@ export async function listAssets(env: AssetManagerEnv, request: Request) {
   await ensureAssetSchema(env.ASSET_INDEX);
   await maybePurgeExpiredDeletedAssets(env);
   const shouldReconcile =
+    !scopeId(scope) &&
     !trash &&
     !query &&
     !folder &&
@@ -1447,8 +1958,12 @@ export async function listAssets(env: AssetManagerEnv, request: Request) {
     (!Number.isFinite(requestedPage) || requestedPage <= 1);
   const truncated = await maybeReconcileBucketObjects(env, shouldReconcile);
 
-  const where = ["assets.status = 'ready'", trash ? "assets.deleted_at IS NOT NULL" : "assets.deleted_at IS NULL"];
-  const binds: (string | number)[] = [];
+  const where = [
+    "assets.demo_session_id = ?",
+    "assets.status = 'ready'",
+    trash ? "assets.deleted_at IS NOT NULL" : "assets.deleted_at IS NULL",
+  ];
+  const binds: (string | number)[] = [scopeId(scope)];
   const searchTerm = `%${query.toLowerCase()}%`;
 
   if (query) {
@@ -1496,8 +2011,9 @@ export async function listAssets(env: AssetManagerEnv, request: Request) {
       env.ASSET_INDEX.prepare(
         `SELECT DISTINCT folder
          FROM assets
-         WHERE status = 'ready'
-           AND ${trash ? "deleted_at IS NOT NULL" : "deleted_at IS NULL"}
+	         WHERE status = 'ready'
+	           AND demo_session_id = ?
+	           AND ${trash ? "deleted_at IS NOT NULL" : "deleted_at IS NULL"}
            AND folder IS NOT NULL
            AND folder != ''
          ORDER BY lower(folder)`,
@@ -1506,14 +2022,23 @@ export async function listAssets(env: AssetManagerEnv, request: Request) {
         `SELECT DISTINCT asset_tags.tag
          FROM asset_tags
          INNER JOIN assets ON assets.id = asset_tags.asset_id
-         WHERE assets.status = 'ready'
-           AND ${trash ? "assets.deleted_at IS NOT NULL" : "assets.deleted_at IS NULL"}
+	         WHERE assets.status = 'ready'
+	           AND assets.demo_session_id = ?
+	           AND ${trash ? "assets.deleted_at IS NOT NULL" : "assets.deleted_at IS NULL"}
          ORDER BY lower(asset_tags.tag)`,
       ),
     );
   }
 
-  const [countResult, foldersResult, tagsResult] = await env.ASSET_INDEX.batch(summaryStatements);
+  const [countResult, foldersResult, tagsResult] = await env.ASSET_INDEX.batch(
+    includeFacets
+      ? [
+          summaryStatements[0],
+          summaryStatements[1].bind(scopeId(scope)),
+          summaryStatements[2].bind(scopeId(scope)),
+        ]
+      : summaryStatements,
+  );
   const countRows = (countResult as D1Result<{ total: number }>).results || [];
   const total = countRows[0]?.total || 0;
   const totalPages = Math.ceil(total / pageSize);
@@ -1580,6 +2105,7 @@ export async function findDuplicateAssets(
   env: AssetManagerEnv,
   contentSha256: string,
   limit = 5,
+  scope?: AssetScope,
 ) {
   await ensureAssetSchema(env.ASSET_INDEX);
 
@@ -1587,13 +2113,14 @@ export async function findDuplicateAssets(
     `SELECT ${assetSelect("assets")}
      FROM assets
      LEFT JOIN asset_tags ON asset_tags.asset_id = assets.id
-     WHERE assets.status = 'ready'
-       AND assets.content_sha256 = ?
+	     WHERE assets.status = 'ready'
+	       AND assets.demo_session_id = ?
+	       AND assets.content_sha256 = ?
      GROUP BY assets.id
      ORDER BY assets.deleted_at IS NOT NULL ASC, datetime(assets.uploaded_at) DESC
      LIMIT ?`,
   )
-    .bind(contentSha256, Math.min(Math.max(limit, 1), 20))
+    .bind(scopeId(scope), contentSha256, Math.min(Math.max(limit, 1), 20))
     .all<AssetRow>();
 
   return result.results || [];
@@ -1663,9 +2190,10 @@ function storagePlanUsage(totalBytes: number, env: Partial<AssetManagerEnv>) {
   };
 }
 
-export async function assetUsage(env: AssetManagerEnv): Promise<AssetUsageResponse> {
+export async function assetUsage(env: AssetManagerEnv, scope?: AssetScope): Promise<AssetUsageResponse> {
   await ensureAssetSchema(env.ASSET_INDEX);
   await maybePurgeExpiredDeletedAssets(env);
+  const currentScopeId = scopeId(scope);
 
   const usageItemSelect = `id,
                            display_name,
@@ -1683,30 +2211,34 @@ export async function assetUsage(env: AssetManagerEnv): Promise<AssetUsageRespon
                 content_type,
                 size_bytes,
                 deleted_at
-         FROM assets
-         WHERE status = 'ready'`,
-      ),
-      env.ASSET_INDEX.prepare(
-        `SELECT ${usageItemSelect}
-         FROM assets
-         WHERE status = 'ready'
-         ORDER BY size_bytes DESC
-         LIMIT 5`,
-      ),
-      env.ASSET_INDEX.prepare(
-        `SELECT ${usageItemSelect}
-         FROM assets
-         WHERE status = 'ready'
-         ORDER BY uploaded_at DESC
-         LIMIT 5`,
-      ),
-      env.ASSET_INDEX.prepare(
-        `SELECT ${usageItemSelect}
-         FROM assets
-         WHERE status IN ('uploading', 'failed')
-         ORDER BY updated_at DESC
-         LIMIT 5`,
-      ),
+	         FROM assets
+	         WHERE status = 'ready'
+	           AND demo_session_id = ?`,
+	      ).bind(currentScopeId),
+	      env.ASSET_INDEX.prepare(
+	        `SELECT ${usageItemSelect}
+	         FROM assets
+	         WHERE status = 'ready'
+	           AND demo_session_id = ?
+	         ORDER BY size_bytes DESC
+	         LIMIT 5`,
+	      ).bind(currentScopeId),
+	      env.ASSET_INDEX.prepare(
+	        `SELECT ${usageItemSelect}
+	         FROM assets
+	         WHERE status = 'ready'
+	           AND demo_session_id = ?
+	         ORDER BY uploaded_at DESC
+	         LIMIT 5`,
+	      ).bind(currentScopeId),
+	      env.ASSET_INDEX.prepare(
+	        `SELECT ${usageItemSelect}
+	         FROM assets
+	         WHERE status IN ('uploading', 'failed')
+	           AND demo_session_id = ?
+	         ORDER BY updated_at DESC
+	         LIMIT 5`,
+	      ).bind(currentScopeId),
     ]);
 
   const aggregateRows = (aggregateResult as D1Result<UsageAggregateRow>).results || [];
@@ -1763,68 +2295,132 @@ export async function assetUsage(env: AssetManagerEnv): Promise<AssetUsageRespon
   };
 }
 
-export async function getAssetById(env: AssetManagerEnv, id: string) {
+export async function getAssetById(env: AssetManagerEnv, id: string, scope?: AssetScope) {
   await ensureAssetSchema(env.ASSET_INDEX);
   return env.ASSET_INDEX.prepare(
     `SELECT ${assetSelect("assets")}
      FROM assets
      LEFT JOIN asset_tags ON asset_tags.asset_id = assets.id
      WHERE assets.id = ?
+       AND assets.demo_session_id = ?
      GROUP BY assets.id`,
   )
-    .bind(id)
+    .bind(id, scopeId(scope))
     .first<AssetRow>();
 }
 
-export async function getAssetBySlug(env: AssetManagerEnv, slug: string) {
+async function getAssetBySlugInScope(env: AssetManagerEnv, slug: string, currentScopeId: string) {
   await ensureAssetSchema(env.ASSET_INDEX);
   return env.ASSET_INDEX.prepare(
     `SELECT ${assetSelect("assets")}
      FROM assets
      LEFT JOIN asset_tags ON asset_tags.asset_id = assets.id
      WHERE assets.slug = ?
+       AND assets.demo_session_id = ?
      GROUP BY assets.id`,
   )
-    .bind(slug)
+    .bind(slug, currentScopeId)
     .first<AssetRow>();
+}
+
+export async function getAssetBySlug(
+  env: AssetManagerEnv,
+  slug: string,
+  scope?: AssetScope,
+  options: { demoOnly?: boolean } = {},
+) {
+  const currentScopeId = scopeId(scope);
+  if (currentScopeId) {
+    const demoAsset = await getAssetBySlugInScope(env, slug, currentScopeId);
+    if (demoAsset || options.demoOnly) return demoAsset;
+  }
+
+  if (options.demoOnly) return null;
+
+  return getAssetBySlugInScope(env, slug, "");
+}
+
+export async function storageObjectKeyForAsset(env: AssetManagerEnv, row: AssetRow) {
+  if (row.demo_session_id && row.demo_storage_owner === "seed" && row.demo_seed_asset_id) {
+    const seed = await getAssetById(env, row.demo_seed_asset_id);
+    return seed?.object_key || null;
+  }
+
+  return row.object_key;
 }
 
 export function deleteAfterFor(deletedAt = new Date()) {
   return new Date(deletedAt.getTime() + TRASH_RETENTION_DAYS * 24 * 60 * 60 * 1000).toISOString();
 }
 
-export async function softDeleteAsset(env: AssetManagerEnv, id: string) {
+export async function softDeleteAsset(env: AssetManagerEnv, id: string, scope?: AssetScope) {
   await ensureAssetSchema(env.ASSET_INDEX);
   const deletedAt = new Date();
   await env.ASSET_INDEX.prepare(
     `UPDATE assets
      SET deleted_at = ?, delete_after = ?, updated_at = ?
-     WHERE id = ?`,
+     WHERE id = ?
+       AND demo_session_id = ?`,
   )
-    .bind(deletedAt.toISOString(), deleteAfterFor(deletedAt), deletedAt.toISOString(), id)
+    .bind(
+      deletedAt.toISOString(),
+      deleteAfterFor(deletedAt),
+      deletedAt.toISOString(),
+      id,
+      scopeId(scope),
+    )
     .run();
 
-  return getAssetById(env, id);
+  return getAssetById(env, id, scope);
 }
 
-export async function restoreAsset(env: AssetManagerEnv, id: string) {
+export async function restoreAsset(env: AssetManagerEnv, id: string, scope?: AssetScope) {
   await ensureAssetSchema(env.ASSET_INDEX);
   await env.ASSET_INDEX.prepare(
     `UPDATE assets
      SET deleted_at = NULL, delete_after = NULL, updated_at = ?
-     WHERE id = ?`,
+     WHERE id = ?
+       AND demo_session_id = ?`,
   )
-    .bind(new Date().toISOString(), id)
+    .bind(new Date().toISOString(), id, scopeId(scope))
     .run();
 
-  return getAssetById(env, id);
+  return getAssetById(env, id, scope);
 }
 
 export async function deleteAssetPermanently(
   env: AssetManagerEnv,
   row: Pick<AssetRow, "id" | "object_key"> &
-    Partial<Pick<AssetRow, "thumbnail_key" | "thumbnail_tiny_key" | "thumbnail_medium_key">>,
+    Partial<
+      Pick<
+        AssetRow,
+        | "thumbnail_key"
+        | "thumbnail_tiny_key"
+        | "thumbnail_medium_key"
+        | "demo_session_id"
+        | "demo_seed_asset_id"
+        | "demo_storage_owner"
+      >
+    >,
 ) {
+  if (row.demo_session_id && row.demo_storage_owner === "seed") {
+    if (row.demo_seed_asset_id) {
+      await env.ASSET_INDEX.prepare(
+        `INSERT OR IGNORE INTO demo_asset_tombstones (
+           demo_session_id,
+           seed_asset_id,
+           created_at
+         ) VALUES (?, ?, ?)`,
+      )
+        .bind(row.demo_session_id, row.demo_seed_asset_id, new Date().toISOString())
+        .run();
+    }
+
+    await env.ASSET_INDEX.prepare("DELETE FROM asset_tags WHERE asset_id = ?").bind(row.id).run();
+    await env.ASSET_INDEX.prepare("DELETE FROM assets WHERE id = ?").bind(row.id).run();
+    return;
+  }
+
   await env.CLOUD_ASSETS.delete(row.object_key);
   const thumbnailKeys = thumbnailKeysFor(row);
   if (thumbnailKeys.length) {
@@ -1838,21 +2434,31 @@ export async function purgeExpiredDeletedAssets(env: AssetManagerEnv) {
   const now = new Date().toISOString();
   const expired = await env.ASSET_INDEX.prepare(
     `SELECT id,
-            object_key,
-            thumbnail_key,
-            thumbnail_tiny_key,
-            thumbnail_medium_key
-     FROM assets
+	            object_key,
+	            thumbnail_key,
+	            thumbnail_tiny_key,
+	            thumbnail_medium_key,
+	            demo_session_id,
+	            demo_seed_asset_id,
+	            demo_storage_owner
+	     FROM assets
      WHERE deleted_at IS NOT NULL AND delete_after IS NOT NULL AND delete_after <= ?
      LIMIT 25`,
   )
     .bind(now)
     .all<
-      Pick<
-        AssetRow,
-        "id" | "object_key" | "thumbnail_key" | "thumbnail_tiny_key" | "thumbnail_medium_key"
-      >
-    >();
+	      Pick<
+	        AssetRow,
+	        | "id"
+	        | "object_key"
+	        | "thumbnail_key"
+	        | "thumbnail_tiny_key"
+	        | "thumbnail_medium_key"
+	        | "demo_session_id"
+	        | "demo_seed_asset_id"
+	        | "demo_storage_owner"
+	      >
+	    >();
 
   for (const row of expired.results || []) {
     await deleteAssetPermanently(env, row);
@@ -1885,6 +2491,7 @@ export async function bulkUpdateAssets(
     addTags?: string[];
     removeTags?: string[];
   },
+  scope?: AssetScope,
 ) {
   await ensureAssetSchema(env.ASSET_INDEX);
 
@@ -1894,12 +2501,13 @@ export async function bulkUpdateAssets(
   const placeholders = ids.map(() => "?").join(", ");
   const selected = await env.ASSET_INDEX.prepare(
     `SELECT id
-     FROM assets
-     WHERE id IN (${placeholders})
-       AND status = 'ready'
-       AND deleted_at IS NULL`,
+	     FROM assets
+	     WHERE id IN (${placeholders})
+	       AND demo_session_id = ?
+	       AND status = 'ready'
+	       AND deleted_at IS NULL`,
   )
-    .bind(...ids)
+    .bind(...ids, scopeId(scope))
     .all<{ id: string }>();
   const activeIds = (selected.results || []).map((row) => row.id);
   if (!activeIds.length) return [];
@@ -1927,10 +2535,11 @@ export async function bulkUpdateAssets(
     updateBinds.push(now);
     await env.ASSET_INDEX.prepare(
       `UPDATE assets
-       SET ${setClauses.join(", ")}
-       WHERE id IN (${activePlaceholders})`,
+	       SET ${setClauses.join(", ")}
+	       WHERE id IN (${activePlaceholders})
+	         AND demo_session_id = ?`,
     )
-      .bind(...updateBinds, ...activeIds)
+      .bind(...updateBinds, ...activeIds, scopeId(scope))
       .run();
   }
 
@@ -1963,11 +2572,12 @@ export async function bulkUpdateAssets(
     `SELECT ${assetSelect("assets")}
      FROM assets
      LEFT JOIN asset_tags ON asset_tags.asset_id = assets.id
-     WHERE assets.id IN (${activePlaceholders})
-     GROUP BY assets.id
-     ORDER BY datetime(assets.uploaded_at) DESC`,
+	     WHERE assets.id IN (${activePlaceholders})
+	       AND assets.demo_session_id = ?
+	     GROUP BY assets.id
+	     ORDER BY datetime(assets.uploaded_at) DESC`,
   )
-    .bind(...activeIds)
+    .bind(...activeIds, scopeId(scope))
     .all<AssetRow>();
 
   return result.results || [];
@@ -1975,13 +2585,13 @@ export async function bulkUpdateAssets(
 
 export type BulkActionFailure = { id: string; error: string };
 
-export async function bulkSoftDeleteAssets(env: AssetManagerEnv, ids: string[]) {
+export async function bulkSoftDeleteAssets(env: AssetManagerEnv, ids: string[], scope?: AssetScope) {
   await ensureAssetSchema(env.ASSET_INDEX);
   const deleted: string[] = [];
   const failed: BulkActionFailure[] = [];
   for (const id of ids) {
     try {
-      const row = await softDeleteAsset(env, id);
+      const row = await softDeleteAsset(env, id, scope);
       if (row) deleted.push(id);
       else failed.push({ id, error: "Asset not found." });
     } catch (error) {
@@ -1994,13 +2604,17 @@ export async function bulkSoftDeleteAssets(env: AssetManagerEnv, ids: string[]) 
   return { deleted, failed };
 }
 
-export async function bulkDeleteAssetsPermanently(env: AssetManagerEnv, ids: string[]) {
+export async function bulkDeleteAssetsPermanently(
+  env: AssetManagerEnv,
+  ids: string[],
+  scope?: AssetScope,
+) {
   await ensureAssetSchema(env.ASSET_INDEX);
   const deleted: string[] = [];
   const failed: BulkActionFailure[] = [];
   for (const id of ids) {
     try {
-      const row = await getAssetById(env, id);
+      const row = await getAssetById(env, id, scope);
       if (!row) {
         failed.push({ id, error: "Asset not found." });
         continue;
@@ -2017,13 +2631,13 @@ export async function bulkDeleteAssetsPermanently(env: AssetManagerEnv, ids: str
   return { deleted, failed };
 }
 
-export async function bulkRestoreAssets(env: AssetManagerEnv, ids: string[]) {
+export async function bulkRestoreAssets(env: AssetManagerEnv, ids: string[], scope?: AssetScope) {
   await ensureAssetSchema(env.ASSET_INDEX);
   const restored: string[] = [];
   const failed: BulkActionFailure[] = [];
   for (const id of ids) {
     try {
-      const row = await restoreAsset(env, id);
+      const row = await restoreAsset(env, id, scope);
       if (row) restored.push(id);
       else failed.push({ id, error: "Asset not found." });
     } catch (error) {
@@ -2059,18 +2673,26 @@ export async function insertAsset(
     | "thumbnail_medium_size_bytes"
     | "thumbnail_medium_etag"
     | "thumbnail_medium_updated_at"
-    | "cache_version"
-    | "allowed_origins"
-    | "inherit_allowed_origins"
-    | "tag_list"
-  > & {
+	    | "cache_version"
+	    | "allowed_origins"
+	    | "inherit_allowed_origins"
+	    | "demo_session_id"
+	    | "demo_seed_asset_id"
+	    | "demo_storage_owner"
+	    | "demo_expires_at"
+	    | "tag_list"
+	  > & {
     uploaded_at?: string;
     updated_at?: string;
-    tags?: string[];
-    deleted_at?: string | null;
-    delete_after?: string | null;
-  },
-) {
+	    tags?: string[];
+	    deleted_at?: string | null;
+	    delete_after?: string | null;
+	    demo_session_id?: string;
+	    demo_seed_asset_id?: string | null;
+	    demo_storage_owner?: "seed" | "demo";
+	    demo_expires_at?: string | null;
+	  },
+	) {
   const now = new Date().toISOString();
   const uploadedAt = row.uploaded_at || now;
   const updatedAt = row.updated_at || now;
@@ -2093,12 +2715,17 @@ export async function insertAsset(
       uploaded_at,
       updated_at,
       deleted_at,
-      delete_after,
-      status
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
-    ON CONFLICT(id) DO UPDATE SET
-      slug = excluded.slug,
-      display_name = excluded.display_name,
+	      delete_after,
+	      status,
+	      demo_session_id,
+	      demo_seed_asset_id,
+	      demo_storage_owner,
+	      demo_expires_at
+	    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	    ON CONFLICT(id) DO UPDATE SET
+	      slug = excluded.slug,
+	      object_key = excluded.object_key,
+	      display_name = excluded.display_name,
       original_filename = excluded.original_filename,
       content_type = excluded.content_type,
       size_bytes = excluded.size_bytes,
@@ -2106,10 +2733,14 @@ export async function insertAsset(
       content_sha256 = excluded.content_sha256,
       folder = excluded.folder,
       cache_policy = excluded.cache_policy,
-      deleted_at = excluded.deleted_at,
-      delete_after = excluded.delete_after,
-      updated_at = excluded.updated_at,
-      status = excluded.status`,
+	      deleted_at = excluded.deleted_at,
+	      delete_after = excluded.delete_after,
+	      demo_session_id = excluded.demo_session_id,
+	      demo_seed_asset_id = excluded.demo_seed_asset_id,
+	      demo_storage_owner = excluded.demo_storage_owner,
+	      demo_expires_at = excluded.demo_expires_at,
+	      updated_at = excluded.updated_at,
+	      status = excluded.status`,
   )
     .bind(
       row.id,
@@ -2125,13 +2756,17 @@ export async function insertAsset(
       row.cache_policy,
       uploadedAt,
       updatedAt,
-      row.deleted_at || null,
-      row.delete_after || null,
-      row.status,
-    )
-    .run();
+	      row.deleted_at || null,
+	      row.delete_after || null,
+	      row.status,
+	      row.demo_session_id || "",
+	      row.demo_seed_asset_id || null,
+	      row.demo_storage_owner || "seed",
+	      row.demo_expires_at || null,
+	    )
+	    .run();
 
-  await setAssetTags(env, row.id, row.tags || []);
+	  await setAssetTags(env, row.id, row.tags || []);
 
-  return getAssetById(env, row.id);
-}
+	  return getAssetById(env, row.id, { demoSessionId: row.demo_session_id || "" });
+	}

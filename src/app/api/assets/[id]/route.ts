@@ -3,6 +3,7 @@ import { requireAssetManagerApiAuth } from "@/lib/auth-gate";
 import {
   corsHeaders,
   deleteAssetPermanently,
+  demoSessionForRequest,
   errorResponse,
   getAssetById,
   jsonResponse,
@@ -38,11 +39,13 @@ export async function PATCH(request: Request, { params }: Params) {
   const headers = corsHeaders(request, env);
   const auth = await requireAssetManagerApiAuth(request, env, headers);
   if (!auth.ok) return auth.response;
+  const demo = await demoSessionForRequest(env, request, headers, { cloneSeedAssets: true });
+  const scope = demo.enabled && demo.sessionId ? { demoSessionId: demo.sessionId } : undefined;
 
   const { id } = await params;
 
   try {
-    const existing = await getAssetById(env, id);
+    const existing = await getAssetById(env, id, scope);
     if (!existing) {
       return errorResponse("Asset not found.", 404, { headers });
     }
@@ -60,7 +63,7 @@ export async function PATCH(request: Request, { params }: Params) {
     };
 
     if (body.restore) {
-      const restored = await restoreAsset(env, id);
+      const restored = await restoreAsset(env, id, scope);
       if (!restored) {
         return errorResponse("Asset not found.", 404, { headers });
       }
@@ -74,7 +77,7 @@ export async function PATCH(request: Request, { params }: Params) {
         : existing.display_name;
     const slug =
       "slug" in body
-        ? await validateUniqueAssetSlug(env, body.slug, { excludeId: id })
+        ? await validateUniqueAssetSlug(env, body.slug, { excludeId: id, scope })
         : existing.slug;
     const folder = "folder" in body ? validateFolder(body.folder) : existing.folder;
     const cachePolicy =
@@ -120,7 +123,7 @@ export async function PATCH(request: Request, { params }: Params) {
       await setAssetTags(env, id, tags);
     }
 
-    const row = await getAssetById(env, id);
+    const row = await getAssetById(env, id, scope);
     if (!row) {
       return errorResponse("Asset not found.", 404, { headers });
     }
@@ -138,13 +141,15 @@ export async function DELETE(request: Request, { params }: Params) {
   const headers = corsHeaders(request, env);
   const auth = await requireAssetManagerApiAuth(request, env, headers);
   if (!auth.ok) return auth.response;
+  const demo = await demoSessionForRequest(env, request, headers, { cloneSeedAssets: true });
+  const scope = demo.enabled && demo.sessionId ? { demoSessionId: demo.sessionId } : undefined;
 
   const { id } = await params;
   const url = new URL(request.url);
   const permanent = url.searchParams.get("permanent") === "true";
 
   try {
-    const row = await getAssetById(env, id);
+    const row = await getAssetById(env, id, scope);
     if (!row) {
       return errorResponse("Asset not found.", 404, { headers });
     }
@@ -154,7 +159,7 @@ export async function DELETE(request: Request, { params }: Params) {
       return new Response(null, { status: 204, headers });
     }
 
-    const deleted = await softDeleteAsset(env, id);
+    const deleted = await softDeleteAsset(env, id, scope);
     if (!deleted) {
       return errorResponse("Asset not found.", 404, { headers });
     }

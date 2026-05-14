@@ -1,4 +1,9 @@
-import { getAssetById, getThumbnailObject, headThumbnailObject } from "@/lib/asset-storage";
+import {
+  getAssetById,
+  getThumbnailObject,
+  headThumbnailObject,
+  optionalDemoSessionForRequest,
+} from "@/lib/asset-storage";
 import { requireAssetDeliveryAuth } from "@/lib/auth-gate";
 import { getAssetManagerEnv } from "@/lib/cloudflare";
 
@@ -76,8 +81,16 @@ async function serveThumbnail(request: Request, { params }: Params, headOnly: bo
   if (!auth.ok) return auth.response;
 
   const { id } = await params;
-  const asset = await getAssetById(env, id);
-  const size = new URL(request.url).searchParams.get("size");
+  const url = new URL(request.url);
+  const demo = await optionalDemoSessionForRequest(env, request);
+  const demoOnly = url.searchParams.get("demo") === "1";
+  const asset =
+    demo.enabled && demo.sessionId
+      ? await getAssetById(env, id, { demoSessionId: demo.sessionId })
+      : demoOnly
+        ? null
+        : await getAssetById(env, id);
+  const size = url.searchParams.get("size");
   const selection = asset ? thumbnailSelection(asset, size) : null;
 
   if (!asset || !selection) {

@@ -7,11 +7,22 @@ This starter is public by default. Auth is intentionally bring-your-own-provider
 Most teams should protect the asset manager UI and APIs while leaving copied asset URLs public:
 
 ```bash
+ASSET_MANAGER_DEMO_MODE=false
 ASSET_MANAGER_AUTH_ENABLED=true
 ASSET_MANAGER_PROTECT_ASSET_DELIVERY=false
 ```
 
 This keeps uploads, edits, deletes, settings, and usage data private while allowing asset links to work on public sites.
+
+Demo mode defaults to `true` for public starter deployments. Leave it on for demos where anonymous visitors should be able to try the UI safely. Turn it off before using the app as a real asset manager.
+
+## Demo Mode Access Model
+
+Demo mode does not replace production auth. It creates an anonymous, cookie-bound sandbox where each visitor sees shared seed assets plus their own temporary actions. Session uploads and replacements are served only to that same browser session and expire after the configured TTL.
+
+Seed assets remain immutable. Moving a seed asset to trash, restoring it, changing metadata, replacing it, or permanently deleting it affects only the visitor's session clone.
+
+Settings updates are disabled in demo mode. The settings UI can display configuration, but PATCH requests return `403` until `ASSET_MANAGER_DEMO_MODE=false`.
 
 ## Connect Your Auth Provider
 

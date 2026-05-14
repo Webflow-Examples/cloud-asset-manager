@@ -3,6 +3,7 @@ import { requireAssetManagerApiAuth } from "@/lib/auth-gate";
 import {
   bulkUpdateAssets,
   corsHeaders,
+  demoSessionForRequest,
   errorResponse,
   jsonResponse,
   normalizeTags,
@@ -24,6 +25,7 @@ export async function PATCH(request: Request) {
   const headers = corsHeaders(request, env);
   const auth = await requireAssetManagerApiAuth(request, env, headers);
   if (!auth.ok) return auth.response;
+  const demo = await demoSessionForRequest(env, request, headers, { cloneSeedAssets: true });
 
   try {
     const body = (await request.json()) as {
@@ -60,7 +62,7 @@ export async function PATCH(request: Request) {
       ...(hasCachePolicy ? { cachePolicy: validateCachePolicy(body.cachePolicy) } : {}),
       addTags,
       removeTags,
-    });
+    }, demo.enabled && demo.sessionId ? { demoSessionId: demo.sessionId } : undefined);
 
     return jsonResponse(
       {

@@ -63,6 +63,19 @@ export const WEBFLOW_LIMITS = [
   },
 ] as const;
 
+export function fileExtension(filename: string) {
+  const cleanName = filename.split(/[\\/]/).pop() || "";
+  const dotIndex = cleanName.lastIndexOf(".");
+  if (dotIndex <= 0 || dotIndex === cleanName.length - 1) {
+    return "";
+  }
+
+  return cleanName
+    .slice(dotIndex)
+    .toLowerCase()
+    .replace(/[^a-z0-9.]/g, "");
+}
+
 export function formatBytes(bytes: number) {
   if (!Number.isFinite(bytes) || bytes < 0) {
     return "0 B";

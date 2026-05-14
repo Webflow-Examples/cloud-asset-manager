@@ -42,6 +42,16 @@ export type AssetManagerAuthUi = {
   account: AssetManagerAuthAction | null;
 };
 
+export type AssetManagerDemoConfig = {
+  enabled: boolean;
+  sessionTtlHours: number;
+  maxSessionBytes: number;
+  maxFileBytes: number;
+  maxSessionAssets: number;
+  allowedFileSummary: string;
+  cleanupMode: "request-time";
+};
+
 export type AssetRow = {
   id: string;
   slug: string;
@@ -77,6 +87,10 @@ export type AssetRow = {
   deleted_at: string | null;
   delete_after: string | null;
   status: "uploading" | "ready" | "failed";
+  demo_session_id: string;
+  demo_seed_asset_id: string | null;
+  demo_storage_owner: "seed" | "demo";
+  demo_expires_at: string | null;
   tag_list?: string | null;
 };
 
@@ -107,6 +121,7 @@ export type Asset = {
   url: string;
   cacheBustedUrl: string;
   kind: "image" | "video" | "pdf" | "model" | "text" | "archive" | "file";
+  demoSessionId: string | null;
 };
 
 export type AssetUsageItem = {
@@ -187,4 +202,5 @@ export type RuntimeConfigResponse = {
   settings: AssetManagerSettings;
   access: AssetManagerAccessStatus;
   authUi: AssetManagerAuthUi;
+  demo: AssetManagerDemoConfig;
 };
