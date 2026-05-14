@@ -1,0 +1,32 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "nextjs",
+  "main": ".open-next/worker.js",
+  "compatibility_date": "2025-03-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "assets": {
+    "binding": "ASSETS",
+    "directory": ".open-next/assets"
+  },
+  "r2_buckets": [
+    {
+      "binding": "CLOUD_ASSETS",
+      "bucket_name": "cloud-assets"
+    },
+    {
+      "binding": "CLOUD_ASSET_THUMBNAILS",
+      "bucket_name": "cloud-asset-thumbnails"
+    }
+  ],
+  "d1_databases": [
+    {
+      "binding": "ASSET_INDEX",
+      "database_name": "asset-index",
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "observability": {
+    "enabled": true
+  }
+}
