@@ -37,7 +37,6 @@ The app is a Next.js App Router project deployed to Webflow Cloud through OpenNe
 - **Metadata:** Search, organization, status, settings, and usage data live in the `ASSET_INDEX` SQLite binding.
 - **Delivery:** Files stream through `/assets/files/:slug` and thumbnails through `/assets/thumbnails/:id`.
 - **Auth:** The starter is public by default. You can wire your provider into `src/lib/auth.ts` and enable auth with environment variables.
-- **Demo mode:** Public starter deployments use session-scoped demo storage by default so visitors can try the UI without changing shared seed assets.
 
 Object Storage does not need to be public. The app serves files through its own delivery routes, which lets you preserve stable links, range requests, thumbnail delivery, cache-busted URL variants, and optional access controls in one place.
 
@@ -121,11 +120,7 @@ The starter works without custom environment variables, but production deploymen
 | `ASSETS_PREFIX` | Worker origin for generated upload/file URLs. Webflow Cloud sets this automatically in production. For local overrides, use an absolute origin without `/assets`; the app appends the mount path. |
 | `STORAGE_PLAN_LIMIT_BYTES` | Enables the usage progress bar against your storage plan limit. |
 | `STORAGE_PLAN_LABEL` | Labels the configured storage plan in the usage dashboard. |
-| `ASSET_MANAGER_DEMO_MODE` | Enables the public demo sandbox. Defaults to `true`; set to `false` for production. |
-| `ASSET_MANAGER_DEMO_SESSION_TTL_HOURS` | Demo session lifetime. Defaults to `6`. |
-| `ASSET_MANAGER_DEMO_MAX_FILE_BYTES` | Per-file demo upload limit. Defaults to `20971520` (20 MB). |
-| `ASSET_MANAGER_DEMO_MAX_SESSION_BYTES` | Total demo upload storage per browser session. Defaults to `52428800` (50 MB). |
-| `ASSET_MANAGER_DEMO_MAX_SESSION_ASSETS` | Maximum demo-owned uploads per browser session. Defaults to `25`. |
+| `ASSET_MANAGER_DEMO_MODE` | Defaults to `true` for the hosted public repo demo. Set to `false` for your own deployment. |
 | `ASSET_MANAGER_DOMAIN_RESTRICTIONS_ENABLED` | Enables origin/referer checks for asset delivery. |
 | `ASSET_MANAGER_ALLOWED_ASSET_ORIGINS` | Comma-separated origins allowed to embed or request protected assets. |
 | `ASSET_MANAGER_ALLOW_DIRECT_ASSET_ACCESS` | Allows direct asset requests with no origin/referer when domain restrictions are enabled. |
@@ -142,9 +137,7 @@ The starter works without custom environment variables, but production deploymen
 
 ## Auth And Access Control
 
-The default starter is intentionally public so you can deploy and test it quickly. Demo mode is enabled by default so public visitors work in a temporary, cookie-bound sandbox. Their uploads, edits, deletes, replacements, and trash actions affect only their browser session and expire automatically.
-
-Disable demo mode before using the app as a real asset manager:
+Demo mode is enabled by default for the hosted public repo demo. Disable it before using your own deployment:
 
 Recommended production posture:
 
@@ -155,16 +148,6 @@ ASSET_MANAGER_PROTECT_ASSET_DELIVERY=false
 ```
 
 That keeps uploads, edits, deletes, settings, and usage data behind auth while allowing copied asset URLs to work on public sites.
-
-## Public Demo Sandbox
-
-When `ASSET_MANAGER_DEMO_MODE` is not set or is set to `true`, the app creates an anonymous session with an HttpOnly cookie. Seed assets are cloned into that session as metadata-only rows that point back to the shared seed objects. New uploads and replacements write under a `demo-sessions/<session-id>/` object prefix and never overwrite seed objects.
-
-Demo sessions expire after 6 hours by default. Expired sessions stop listing and serving session uploads immediately. Cleanup runs opportunistically on normal app/API requests and deletes small batches of expired session rows, demo objects, demo thumbnails, and tombstones. If the app receives no traffic, expired objects may remain in storage until the next request, but they are not accessible after expiry.
-
-Demo uploads intentionally have additional limits: 20 MB per file, 50 MB per session, and 25 demo-owned uploads per session. The public demo allows common images except SVG, PDFs, text, CSV, JSON, ZIP, MP4, WebM, MOV, GLB, and GLTF. HTML, SVG, JavaScript, shell scripts, executables, unknown binary files, and unsupported archives are blocked in demo mode. Production deployments can change this policy in code after disabling demo mode and adding auth.
-
-For heavily promoted public demos, add platform-level protections such as WAF/rate limits, Turnstile before upload, and malware scanning.
 
 To connect auth:
 
@@ -216,12 +199,6 @@ Preview the production build locally:
 
 ```bash
 npm run preview
-```
-
-With a preview or deployed demo running, exercise the demo sandbox contract:
-
-```bash
-DEMO_CHECK_BASE_URL=http://localhost:8787/assets npm run check:demo
 ```
 
 ## Current Boundaries

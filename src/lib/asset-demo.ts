@@ -62,62 +62,20 @@ const DEMO_BLOCKED_MIME_PARTS = [
   "xml",
 ];
 
-export function envValue(env: Partial<AssetManagerEnv>, key: keyof AssetManagerEnv) {
-  const runtimeValue = env[key];
-  if (typeof runtimeValue === "string") return runtimeValue;
-  if (typeof process === "undefined") return undefined;
-  return process.env[key];
-}
-
-function envNumber(
-  env: Partial<AssetManagerEnv>,
-  key: keyof AssetManagerEnv,
-  fallback: number,
-  options: { min?: number; max?: number } = {},
-) {
-  const value = Number(envValue(env, key) || 0);
-  if (!Number.isFinite(value) || value <= 0) return fallback;
-  return Math.min(Math.max(Math.floor(value), options.min ?? 1), options.max ?? Number.MAX_SAFE_INTEGER);
-}
-
 export function demoModeEnabled(env: Partial<AssetManagerEnv>) {
-  return String(envValue(env, "ASSET_MANAGER_DEMO_MODE") ?? "true").toLowerCase() !== "false";
+  const runtimeValue = env.ASSET_MANAGER_DEMO_MODE;
+  const processValue =
+    typeof process === "undefined" ? undefined : process.env.ASSET_MANAGER_DEMO_MODE;
+  return String(runtimeValue ?? processValue ?? "true").toLowerCase() !== "false";
 }
 
 export function demoRuntimeConfig(env: Partial<AssetManagerEnv>) {
-  const sessionTtlHours = envNumber(env, "ASSET_MANAGER_DEMO_SESSION_TTL_HOURS", DEMO_SESSION_TTL_HOURS, {
-    min: 1,
-    max: 24,
-  });
-  const maxFileBytes = envNumber(env, "ASSET_MANAGER_DEMO_MAX_FILE_BYTES", DEMO_MAX_FILE_BYTES, {
-    min: 1024,
-    max: DEMO_MAX_SESSION_BYTES,
-  });
-  const maxSessionBytes = envNumber(
-    env,
-    "ASSET_MANAGER_DEMO_MAX_SESSION_BYTES",
-    DEMO_MAX_SESSION_BYTES,
-    {
-      min: maxFileBytes,
-      max: 1024 * 1024 * 1024,
-    },
-  );
-  const maxSessionAssets = envNumber(
-    env,
-    "ASSET_MANAGER_DEMO_MAX_SESSION_ASSETS",
-    DEMO_MAX_SESSION_ASSETS,
-    {
-      min: 1,
-      max: 100,
-    },
-  );
-
   return {
     enabled: demoModeEnabled(env),
-    sessionTtlHours,
-    maxSessionBytes,
-    maxFileBytes,
-    maxSessionAssets,
+    sessionTtlHours: DEMO_SESSION_TTL_HOURS,
+    maxSessionBytes: DEMO_MAX_SESSION_BYTES,
+    maxFileBytes: DEMO_MAX_FILE_BYTES,
+    maxSessionAssets: DEMO_MAX_SESSION_ASSETS,
     allowedFileSummary: DEMO_ALLOWED_FILE_SUMMARY,
     cleanupMode: DEMO_CLEANUP_MODE,
   };
