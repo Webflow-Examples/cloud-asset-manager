@@ -1065,8 +1065,41 @@ export async function updateAssetManagerSettings(
   return getAssetManagerSettings(env);
 }
 
+function originFromUrl(value: string | null) {
+  if (!value) return null;
+
+  try {
+    const url = new URL(value);
+    return url.protocol === "http:" || url.protocol === "https:" ? url.origin : null;
+  } catch {
+    return null;
+  }
+}
+
+function forwardedOrigin(request: Request) {
+  const forwardedHost =
+    request.headers.get("x-forwarded-host") || request.headers.get("x-original-host");
+  if (!forwardedHost) return null;
+
+  const proto =
+    request.headers.get("x-forwarded-proto")?.split(",")[0]?.trim() ||
+    new URL(request.url).protocol.replace(/:$/, "");
+  const host = forwardedHost.split(",")[0]?.trim();
+
+  return host ? `${proto || "https"}://${host}` : null;
+}
+
+function publicRequestOrigin(request: Request) {
+  return (
+    originFromUrl(request.headers.get("origin")) ||
+    originFromUrl(request.headers.get("referer")) ||
+    forwardedOrigin(request) ||
+    new URL(request.url).origin
+  );
+}
+
 export function getUploadBaseUrl(request: Request, env: Partial<AssetManagerEnv>) {
-  const origin = new URL(request.url).origin;
+  const origin = publicRequestOrigin(request);
   if (demoModeEnabled(env)) {
     return `${origin}${APP_BASE_PATH}`;
   }
@@ -1530,7 +1563,7 @@ export async function deleteThumbnailObjects(env: AssetManagerEnv, keys: string[
 }
 
 export function rowToAsset(row: AssetRow, request: Request): Asset {
-  const origin = new URL(request.url).origin;
+  const origin = publicRequestOrigin(request);
   const cacheVersion = row.cache_version || 1;
   const baseStableUrl = assetStableUrl(row.slug || row.id, origin);
   const stableUrl = row.demo_session_id ? `${baseStableUrl}?demo=1` : baseStableUrl;
