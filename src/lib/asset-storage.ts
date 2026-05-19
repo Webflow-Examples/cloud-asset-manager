@@ -1067,6 +1067,10 @@ export async function updateAssetManagerSettings(
 
 export function getUploadBaseUrl(request: Request, env: Partial<AssetManagerEnv>) {
   const origin = new URL(request.url).origin;
+  if (demoModeEnabled(env)) {
+    return `${origin}${APP_BASE_PATH}`;
+  }
+
   const prefix = env.ASSETS_PREFIX?.replace(/\/$/, "");
   return `${prefix || origin}${APP_BASE_PATH}`;
 }
